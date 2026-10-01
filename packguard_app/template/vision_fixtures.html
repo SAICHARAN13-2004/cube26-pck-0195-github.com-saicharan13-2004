@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Vision set · PackGuard{% endblock %}
+{% block content %}
+<section class="page-head compact"><div><p class="eyebrow">Vision review set</p><h1>Image mappings</h1><p class="lede">Review each available fixture image beside its expected SKU, quantity, and decision.</p></div></section>
+<section class="vision-set-grid">
+{% for fixture in fixtures %}
+<article class="vision-card">
+  <div class="vision-card-image"><a href="{{ url_for('vision_fixture_image', filename=fixture.image_filename) }}" aria-label="Open full-size {{ fixture.fixture_id }} image"><img src="{{ fixture.image_url }}" alt="{{ fixture.fixture_id }}" loading="lazy"><span class="vision-image-button">Open image ↗</span></a><span class="vision-card-id">{{ fixture.fixture_id }}</span></div>
+  <div class="vision-card-body"><div class="vision-card-heading"><h2>{% if fixture.sku and fixture.sku != 'MULTIPLE' %}<a class="vision-product-link" href="{{ url_for('product_detail', sku=fixture.sku) }}">{{ fixture.sku }}</a>{% else %}{{ fixture.sku or 'Not mapped' }}{% endif %}</h2><span class="vision-quantity">×{{ fixture.quantity or '?' }}</span></div><p class="vision-card-file">{{ fixture.image_filename }}</p><div class="vision-card-status"><span class="vision-chip vision-chip-{{ fixture.expected_decision|lower|replace('_', '-') if fixture.expected_decision else 'empty' }}">{{ fixture.expected_decision or 'NOT LABELED' }}</span><span class="vision-verdict">{{ fixture.expected_verdict or 'UNLABELED' }}</span></div><p class="vision-card-notes">{{ fixture.notes or 'Add mapping notes in the CSV.' }}</p></div>
+</article>
+{% else %}<p class="empty">No fixture images are currently mapped in the CSV.</p>{% endfor %}
+</section>
+{% endblock %}

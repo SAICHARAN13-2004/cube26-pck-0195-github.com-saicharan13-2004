@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ record.record_id }} · Pack evidence report</title>
+<style>
+body{font:14px Arial,sans-serif;color:#172a32;max-width:900px;margin:40px auto;padding:0 24px}h1{font-size:32px}h2{margin-top:28px;border-bottom:2px solid #e993ab;padding-bottom:8px}dl{display:grid;grid-template-columns:190px 1fr;gap:10px}dt{font-weight:700;color:#53656a}dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}th,td{padding:8px;border:1px solid #dce5df;text-align:left}th{background:#f6dfae}.event{padding:10px 0;border-bottom:1px solid #dce5df}.no-print{position:fixed;right:20px;top:20px;padding:10px 14px;border:0;border-radius:7px;background:#e993ab;color:#000;font-weight:bold}@media print{body{margin:0}.no-print{display:none}}
+</style>
+</head>
+<body>
+<button class="no-print" onclick="window.print()">Print / Save PDF</button>
+<h1>PackGuard outbound evidence report</h1>
+<p>Open-box verification before sealing an outbound order</p>
+<h2>Outbound order details</h2>
+<dl>
+<dt>Inspection record</dt><dd>{{ record.record_id }}</dd>
+<dt>Outbound order ID</dt><dd>{{ record.order_id }}</dd>
+<dt>Packing unit</dt><dd>{{ record.unit_id }}</dd>
+<dt>Organization</dt><dd>{{ record.org_id }}</dd>
+<dt>Packing channel</dt><dd>{{ record.channel|replace('_', ' ') }}</dd>
+<dt>Operator</dt><dd>{{ record.operator_id }}</dd>
+<dt>Verdict</dt><dd>{{ record.verdict }}</dd>
+<dt>Workflow state</dt><dd>{{ record.workflow_state }}</dd>
+<dt>Session / attempt</dt><dd>{{ record.session_id or record.record_id }} · attempt {{ record.attempt_number or 1 }} of {{ record.session_records|length }}</dd>
+<dt>Decision reason</dt><dd>{{ record.reason }}</dd>
+<dt>Captured</dt><dd>{{ record.captured_at }}</dd>
+</dl>
+<h2>Expected versus observed contents</h2>
+<dl><dt>Expected PO lines</dt><dd>{{ record.order_lines }}</dd><dt>Observed received items</dt><dd>{{ record.observed_in_box or 'Not recorded' }}</dd></dl>
+<h2>Component checks</h2>
+<table><thead><tr><th>Check</th><th>Result</th><th>Reason</th></tr></thead><tbody>
+{% for check in record.evidence.checks %}<tr><td>{{ check.check|replace('_', ' ')|title }}{% if check.sku is defined %} · {{ check.sku }}{% endif %}</td><td>{{ check.status }}</td><td>{{ check.reason }}</td></tr>{% else %}<tr><td colspan="3">No component checks recorded.</td></tr>{% endfor %}
+</tbody></table>
+<h2>Audit history</h2>
+{% for event in record.audit_events %}<div class="event"><strong>{{ event.event_type|replace('_', ' ')|title }}</strong> · {{ event.actor_id }} · {{ event.created_at }}<br>{{ event.reason }}</div>{% else %}<p>No audit events recorded.</p>{% endfor %}
+</body>
+</html>

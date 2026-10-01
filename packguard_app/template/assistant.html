@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}PackGuard assistant · PackGuard{% endblock %}
+{% block content %}
+<section class="page-head compact"><div><a class="back-link" href="{{ url_for('dashboard') }}">← Dashboard</a><p class="eyebrow">Workspace assistant / {{ active_org }}</p><h1>PackGuard assistant</h1><p class="lede">Ask general questions or get answers from this organization's orders and evidence.</p></div></section>
+<section class="assistant-panel assistant-page-panel"><div class="assistant-heading"><span class="assistant-icon">✦</span><div><p class="eyebrow">PackGuard assistant</p><h2>How can I help?</h2><p>Workspace-specific answers use {{ active_org }} data.</p></div></div><div class="assistant-prompts"><button type="button" data-question="How many alerts do we have?">Active alerts</button><button type="button" data-question="Which orders need review?">Needs review</button><button type="button" data-question="What is the PackGuard workflow?">Pack workflow</button></div><div id="assistant-chat" class="assistant-chat" role="log" aria-live="polite" aria-relevant="additions"><div class="assistant-message assistant-message-bot"><span class="assistant-message-label">PackGuard assistant</span><p>Hi! Ask a question about PackGuard or another topic.</p></div></div><form id="assistant-form" class="assistant-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input id="assistant-question" name="question" placeholder="Type a message..." autocomplete="off"><button class="button button-primary" type="submit">Send <span>→</span></button></form></section>
+<script>
+const assistantForm = document.getElementById('assistant-form');
+const assistantQuestion = document.getElementById('assistant-question');
+const assistantChat = document.getElementById('assistant-chat');
+const assistantHistory = [];
+const assistantSendButton = assistantForm.querySelector('button[type="submit"]');
+function addAssistantMessage(role, text) {
+  const message = document.createElement('div');
+  message.className = `assistant-message ${role === 'user' ? 'assistant-message-user' : 'assistant-message-bot'}`;
+  const label = document.createElement('span');
+  label.className = 'assistant-message-label';
+  label.textContent = role === 'user' ? 'You' : 'PackGuard assistant';
+  const body = document.createElement('p');
+  body.textContent = text;
+  message.append(label, body);
+  assistantChat.append(message);
+  assistantChat.scrollTop = assistantChat.scrollHeight;
+  return body;
+}
+document.querySelectorAll('[data-question]').forEach((button) => button.addEventListener('click', () => {
+  assistantQuestion.value = button.dataset.question;
+  assistantForm.requestSubmit();
+}));
+assistantForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const question = assistantQuestion.value.trim();
+  if (!question || assistantSendButton.disabled) return;
+  assistantQuestion.value = '';
+  addAssistantMessage('user', question);
+  const previousHistory = assistantHistory.slice(-8);
+  assistantHistory.push({role: 'user', content: question});
+  const pendingMessage = addAssistantMessage('assistant', 'Thinking...');
+  assistantSendButton.disabled = true;
+  try {
+    const response = await fetch('{{ url_for("assistant_api") }}', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-CSRFToken': assistantForm.elements.csrf_token.value},
+      body: JSON.stringify({question, history: previousHistory})
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'The assistant could not answer just now.');
+    pendingMessage.textContent = data.answer || 'I could not produce an answer just now.';
+    assistantHistory.push({role: 'assistant', content: pendingMessage.textContent});
+  } catch (error) {
+    pendingMessage.textContent = error.message || 'I could not reach the assistant. Please try again.';
+  } finally {
+    assistantSendButton.disabled = false;
+    assistantQuestion.focus();
+  }
+});
+</script>
+{% endblock %}

@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}{{ product.product_name }} · PackGuard Catalog{% endblock %}
+{% block content %}
+<section class="page-head compact"><div><a class="back-link" href="{{ url_for('product_catalog') }}">← Product catalog</a><p class="eyebrow">Product details / {{ active_org }}</p><h1>{{ product.product_name }}</h1><p class="lede">Catalog identity and reference information for this workspace.</p></div></section>
+<section class="product-detail-panel">
+  <div class="product-detail-image">{% if product.reference_image_ref and (product.reference_image_ref.startswith(active_org + '/') or product.reference_image_ref.startswith('fixtures/vision/')) %}<a href="{{ url_for('media_file', filename=product.reference_image_ref) }}" target="_blank" rel="noopener" aria-label="Open full-size product reference image"><img src="{{ url_for('media_file', filename=product.reference_image_ref) }}" alt="Reference image for {{ product.product_name }}"></a><a class="catalog-details-link" href="{{ url_for('media_file', filename=product.reference_image_ref) }}" target="_blank" rel="noopener">Open full-size image ↗</a>{% else %}<div class="catalog-product-placeholder product-detail-placeholder">📦<span>No reference image saved</span></div>{% endif %}</div>
+  <dl class="product-detail-list"><div><dt>Product name</dt><dd>{{ product.product_name }}</dd></div><div><dt>Product ID</dt><dd>{{ product.product_id }}</dd></div><div><dt>SKU</dt><dd>{{ product.sku }}</dd></div><div><dt>Brand</dt><dd>{{ product.brand or 'Not recorded' }}</dd></div><div><dt>External product ID</dt><dd>{{ product.external_id or 'Not recorded' }}</dd></div><div><dt>Barcode</dt><dd>{{ product.barcode or 'Not recorded' }}</dd></div><div><dt>Variant attributes</dt><dd><code>{{ product.attributes|tojson }}</code></dd></div><div><dt>Reference</dt><dd>{{ product.reference_image_ref or 'Not recorded' }}</dd></div></dl>
+</section>
+<section class="product-detail-actions"><a class="button button-primary" href="{{ url_for('capture') }}">New pack check for this product <span>→</span></a></section>
+{% endblock %}

@@ -1,0 +1,118 @@
+services:
+  database:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  database-users-init:
+    image: postgres:16-alpine
+    depends_on:
+      database:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/init-postgres.sh"]
+    volumes:
+      - ./ops/init-postgres.sh:/init-postgres.sh:ro
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      PACKGUARD_APP_DB_USER: ${PACKGUARD_APP_DB_USER:?Set PACKGUARD_APP_DB_USER in .env}
+      PACKGUARD_APP_DB_PASSWORD: ${PACKGUARD_APP_DB_PASSWORD:?Set PACKGUARD_APP_DB_PASSWORD in .env}
+      PACKGUARD_MIGRATOR_DB_USER: ${PACKGUARD_MIGRATOR_DB_USER:?Set PACKGUARD_MIGRATOR_DB_USER in .env}
+      PACKGUARD_MIGRATOR_DB_PASSWORD: ${PACKGUARD_MIGRATOR_DB_PASSWORD:?Set PACKGUARD_MIGRATOR_DB_PASSWORD in .env}
+    restart: "no"
+
+  object-storage:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - evidence_data:/data
+    expose:
+      - "9000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  bucket-init:
+    image: minio/mc:RELEASE.2024-11-17T19-35-25Z
+    depends_on:
+      object-storage:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >-
+      mc alias set local http://object-storage:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" &&
+      mc mb --ignore-existing local/packguard-evidence &&
+      mc anonymous set private local/packguard-evidence &&
+      (mc admin policy info local packguard-evidence-rw >/dev/null 2>&1 || mc admin policy create local packguard-evidence-rw /policy.json) &&
+      (mc admin user info local "$${MINIO_APP_USER}" >/dev/null 2>&1 || mc admin user add local "$${MINIO_APP_USER}" "$${MINIO_APP_PASSWORD}") &&
+      mc admin policy attach local packguard-evidence-rw --user "$${MINIO_APP_USER}" &&
+      printf '{"CORSRules":[{"AllowedOrigins":["%s"],"AllowedMethods":["PUT"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":3600}]}' "$${PACKGUARD_PUBLIC_URL}" > /tmp/cors.json &&
+      mc cors set local/packguard-evidence /tmp/cors.json
+    volumes:
+      - ./ops/minio-policy.json:/policy.json:ro
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+      MINIO_APP_USER: ${MINIO_APP_USER:?Set MINIO_APP_USER in .env}
+      MINIO_APP_PASSWORD: ${MINIO_APP_PASSWORD:?Set MINIO_APP_PASSWORD in .env}
+      PACKGUARD_PUBLIC_URL: ${PACKGUARD_PUBLIC_URL:?Set PACKGUARD_PUBLIC_URL to your HTTPS URL}
+    restart: "no"
+
+  app:
+    build:
+      context: ..
+      dockerfile: packguard_app/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      database:
+        condition: service_healthy
+      database-users-init:
+        condition: service_completed_successfully
+      bucket-init:
+        condition: service_completed_successfully
+    environment:
+      PACKGUARD_ENV: production
+      PACKGUARD_SECRET_KEY: ${PACKGUARD_SECRET_KEY:?Set PACKGUARD_SECRET_KEY in .env}
+      PACKGUARD_ALLOW_DEMO_LOGIN: "false"
+      PACKGUARD_AUTO_SEAL_ENABLED: "false"
+      PACKGUARD_TRUSTED_PROXY_COUNT: ${PACKGUARD_TRUSTED_PROXY_COUNT:-1}
+      PACKGUARD_PUBLIC_URL: ${PACKGUARD_PUBLIC_URL:?Set PACKGUARD_PUBLIC_URL to your HTTPS URL}
+      PACKGUARD_OIDC_ISSUER_URL: ${PACKGUARD_OIDC_ISSUER_URL:?Set PACKGUARD_OIDC_ISSUER_URL}
+      PACKGUARD_OIDC_CLIENT_ID: ${PACKGUARD_OIDC_CLIENT_ID:?Set PACKGUARD_OIDC_CLIENT_ID}
+      PACKGUARD_OIDC_CLIENT_SECRET: ${PACKGUARD_OIDC_CLIENT_SECRET:?Set PACKGUARD_OIDC_CLIENT_SECRET}
+      PACKGUARD_OIDC_REDIRECT_URI: ${PACKGUARD_OIDC_REDIRECT_URI:?Set PACKGUARD_OIDC_REDIRECT_URI}
+      PACKGUARD_DATABASE_URL: postgresql://${PACKGUARD_APP_DB_USER}:${PACKGUARD_APP_DB_PASSWORD}@database:5432/${POSTGRES_DB}
+      PACKGUARD_DATABASE_MIGRATION_URL: postgresql://${PACKGUARD_MIGRATOR_DB_USER}:${PACKGUARD_MIGRATOR_DB_PASSWORD}@database:5432/${POSTGRES_DB}
+      PACKGUARD_OBJECT_STORAGE_URL: s3://packguard-evidence
+      PACKGUARD_S3_ENDPOINT_URL: http://object-storage:9000
+      PACKGUARD_S3_REGION: us-east-1
+      PACKGUARD_S3_ENCRYPTION: AES256
+      AWS_ACCESS_KEY_ID: ${MINIO_APP_USER:?Set MINIO_APP_USER in .env}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_APP_PASSWORD:?Set MINIO_APP_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${PACKGUARD_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  postgres_data:
+  evidence_data:

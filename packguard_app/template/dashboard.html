@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Pack station · PackGuard{% endblock %}
+{% block content %}
+<section class="dashboard-search" aria-label="Search products and orders"><form id="dashboard-search-form" role="search"><label for="dashboard-search-input">Search products and orders</label><div class="dashboard-search-row"><input id="dashboard-search-input" type="search" minlength="2" placeholder="Search product name, SKU, order, unit, or record ID" autocomplete="off" aria-autocomplete="list" aria-controls="dashboard-search-results" aria-expanded="false"><button class="button button-primary" type="submit">Search <span>⌕</span></button></div></form><div id="dashboard-search-results" class="dashboard-search-results" aria-live="polite"></div></section>
+<section class="page-head dashboard-head">
+  <div><p class="eyebrow">📦 Outbound packing / {{ active_org }}</p><h1>Pack station</h1><p class="lede">Verify every item in an open package before sealing it for the buyer.</p><span class="dashboard-live">● Workspace live · pre-seal checks ready</span></div>
+  <a class="button button-primary" href="{{ url_for('capture') }}"><span>➕</span> New check</a>
+</section>
+<section class="metrics" aria-label="Decision summary">
+  <div class="metric metric-total"><span>📋 Total checks</span><strong>{{ counts.total }}</strong><small>this workspace</small></div>
+  <div class="metric metric-pass"><span>✅ Ready to seal</span><strong>{{ counts.pass }}</strong><small>all pack checks pass</small></div>
+  <div class="metric metric-fail"><span>🛑 Stop and fix</span><strong>{{ counts.fail }}</strong><small>wrong, missing, or extra contents</small></div>
+  <div class="metric metric-uncertain"><span>🔎 Needs review</span><strong>{{ counts.uncertain }}</strong><small>insufficient evidence</small></div>
+</section>
+<section class="readiness-banner"><div class="readiness-icon">✦</div><div><p class="eyebrow">Evidence readiness</p><h2>Every decision leaves a trail.</h2><p>Capture the box, compare every SKU, and keep the reason visible for the next operator.</p></div><a class="button button-secondary" href="{{ url_for('evaluation_summary_page') }}">View summary <span>→</span></a></section>
+{% if video_records %}<section class="video-shelf"><div class="section-head"><div><p class="eyebrow">🎥 Packing evidence</p><h2>Recent packing videos</h2></div><span class="muted">{{ video_records|length }} available</span></div><div class="video-grid">{% for record in video_records %}<article class="video-card"><video controls preload="metadata" src="{{ url_for('media_file', filename=record.video_ref) }}"></video><div class="video-card-meta"><div><strong>{{ record.unit_id }}</strong><span>{{ record.order_id }} · {{ record.order_lines }}</span></div><span class="status status-{{ record.verdict|lower }}">{{ record.verdict }}</span></div><a class="video-card-link" href="{{ url_for('record_detail', record_id=record.record_id) }}">Open evidence →</a></article>{% endfor %}</div></section>{% endif %}
+<section class="section-head"><div><p class="eyebrow">Pack log</p><h2>Recent pre-seal checks</h2></div><span class="muted">Tenant isolated · {{ active_org }}</span></section>
+<div class="table-wrap dashboard-checks"><table><thead><tr><th>Inspection</th><th>Outbound order</th><th>Channel</th><th>Decision</th><th>Captured</th><th></th></tr></thead><tbody>
+{% for record in records %}<tr><td><a class="record-link" href="{{ url_for('record_detail', record_id=record.record_id) }}">{{ record.record_id }}</a><span class="subline">Unit {{ record.unit_id }}</span>{% if record.video_ref %}<span class="media-badge">🎥 Packing video</span>{% endif %}{% if record.photo_ref and record.photo_ref.startswith(record.org_id + '/') %}<a class="recent-photo" href="{{ url_for('media_file', filename=record.photo_ref) }}" target="_blank" rel="noopener"><img src="{{ url_for('media_file', filename=record.photo_ref) }}" alt="Open-box evidence for {{ record.order_id }}" loading="lazy"><span>Photo evidence</span></a>{% endif %}</td><td class="order-channel-color">{{ record.order_id }}</td><td><span class="channel order-channel-color">{{ record.channel|replace('_', ' ') }}</span></td><td><span class="status status-{{ record.verdict|lower }}">{{ record.verdict }}</span><span class="subline">{{ record.workflow_state|replace('_', ' ') }}</span></td><td class="muted">{{ record.captured_at[:16].replace('T', ' ') }}</td><td><a class="arrow-link" aria-label="Open inspection record" href="{{ url_for('record_detail', record_id=record.record_id) }}">→</a></td></tr>
+{% else %}<tr><td colspan="6" class="empty">No pack checks yet. Start with an open outbound package.</td></tr>{% endfor %}
+</tbody></table></div>
+<section class="note-band"><div class="note-icon">💡</div><div><strong>How PackGuard decides</strong><p>Expected order lines are compared with the observed box contents. Every SKU and quantity gets its own check. Missing observations remain <b>UNCERTAIN</b>; they never become a quiet pass.</p></div></section>
+<script>
+const dashboardSearchForm = document.getElementById('dashboard-search-form');
+const dashboardSearchInput = document.getElementById('dashboard-search-input');
+const dashboardSearchResults = document.getElementById('dashboard-search-results');
+let dashboardSearchTimer;
+let dashboardSearchRequest = 0;
+async function searchDashboard(query) {
+  const requestId = ++dashboardSearchRequest;
+  dashboardSearchResults.replaceChildren();
+  if (query.length < 2) {
+    dashboardSearchInput.setAttribute('aria-expanded', 'false');
+    return;
+  }
+  dashboardSearchResults.textContent = 'Searching this workspace...';
+  try {
+    const searchUrl = new URL('{{ url_for("search_api") }}', window.location.origin);
+    searchUrl.searchParams.set('q', query);
+    const response = await fetch(searchUrl);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Search is unavailable.');
+    if (requestId !== dashboardSearchRequest) return;
+    dashboardSearchResults.replaceChildren();
+    if (!data.results.length) {
+      dashboardSearchResults.textContent = 'No products or orders found in this workspace.';
+      dashboardSearchInput.setAttribute('aria-expanded', 'false');
+      return;
+    }
+    for (const result of data.results) {
+      const link = document.createElement('a');
+      link.className = 'dashboard-search-result';
+      link.href = result.url;
+      const kind = document.createElement('span');
+      kind.className = 'search-result-kind';
+      kind.textContent = result.type;
+      const title = document.createElement('strong');
+      title.textContent = result.title;
+      const detail = document.createElement('small');
+      detail.textContent = result.subtitle;
+      link.append(kind, title, detail);
+      dashboardSearchResults.append(link);
+    }
+    dashboardSearchInput.setAttribute('aria-expanded', 'true');
+  } catch (error) {
+    if (requestId !== dashboardSearchRequest) return;
+    dashboardSearchResults.textContent = error.message || 'Search failed. Please try again.';
+    dashboardSearchInput.setAttribute('aria-expanded', 'false');
+  }
+}
+dashboardSearchInput.addEventListener('input', () => {
+  clearTimeout(dashboardSearchTimer);
+  const query = dashboardSearchInput.value.trim();
+  if (query.length < 2) {
+    dashboardSearchRequest++;
+    dashboardSearchResults.replaceChildren();
+    dashboardSearchInput.setAttribute('aria-expanded', 'false');
+    return;
+  }
+  dashboardSearchTimer = setTimeout(() => searchDashboard(query), 220);
+});
+dashboardSearchForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  clearTimeout(dashboardSearchTimer);
+  searchDashboard(dashboardSearchInput.value.trim());
+});
+</script>
+{% endblock %}

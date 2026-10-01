@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · PackGuard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260928-pastel-mix-1') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/theme-overrides.css', v='20260928-pastel-final-17') }}">
+</head>
+<body>
+  <main class="login-shell">
+    <section class="login-panel">
+      <p class="eyebrow">Evidence-first outbound checks</p>
+      <h1>Sign in to PackGuard</h1>
+      <p class="lede">Sign in to access your organization workspace.</p>
+      {% if error %}<p class="login-error">{{ error }}</p>{% endif %}
+      {% if oidc_enabled %}<a class="button button-primary button-wide" href="{{ url_for('oidc_login') }}">Continue with organization sign-in</a>{% endif %}
+      {% if local_login_enabled %}
+      <form method="post" class="login-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>Username<input name="username" autocomplete="username" required></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+        <button class="button button-primary button-wide" type="submit">Sign in <span>→</span></button>
+      </form>
+      {% endif %}
+      {% if demo_login_enabled %}<div class="demo-accounts"><strong>Local demo accounts</strong><span>alpha.operator / alpha-demo</span><span>bravo.operator / bravo-demo</span></div>{% endif %}
+    </section>
+  </main>
+</body>
+</html>

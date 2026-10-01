@@ -1,0 +1,51 @@
+fixture_id,split,sku,quantity,image_filename,expected_verdict,expected_decision,annotator_a_decision,annotator_b_decision,adjudicated_decision,notes
+HOLD-001,held_out,SKU-CABLE-USBC,1,HOLD-001.jpg,PASS,SEAL,SEAL,SEAL,SEAL,Correct single USB-C cable clearly visible
+HOLD-002,held_out,SKU-BOTTLE-750,2,HOLD-002.jpg,PASS,SEAL,SEAL,SEAL,SEAL,Two bottles clearly visible and separated
+HOLD-003,held_out,SKU-CABLE-USBC,1,HOLD-003.jpg,FAIL,FIX,FIX,FIX,FIX,Expected cable is missing
+HOLD-004,held_out,SKU-CABLE-USBC,1,HOLD-004.jpg,FAIL,FIX,FIX,FIX,FIX,Unexpected extra bottle is present
+HOLD-005,held_out,SKU-CABLE-USBC,1,HOLD-005.jpg,FAIL,FIX,FIX,FIX,FIX,Wrong product is inside the box
+HOLD-006,held_out,SKU-CANDLE-3,1,HOLD-006.jpg,FAIL,FIX,FIX,FIX,FIX,Wrong product variant
+HOLD-007,held_out,SKU-CABLE-USBC,1,HOLD-007.jpg,UNCERTAIN,RECAPTURE,RECAPTURE,RECAPTURE,RECAPTURE,Image is blurry
+HOLD-008,held_out,SKU-CABLE-USBC,1,HOLD-008.jpg,UNCERTAIN,RECAPTURE,RECAPTURE,RECAPTURE,RECAPTURE,Image has poor lighting
+HOLD-009,held_out,SKU-BOTTLE-750,2,HOLD-009.jpg,UNCERTAIN,MANUAL_REVIEW,MANUAL_REVIEW,MANUAL_REVIEW,MANUAL_REVIEW,One item is hidden or quantity is unclear
+HOLD-010,held_out,MULTIPLE,3,HOLD-010.jpg,UNCERTAIN,MANUAL_REVIEW,MANUAL_REVIEW,MANUAL_REVIEW,MANUAL_REVIEW,Multiple products require human review
+HOLD-011,held_out,,,,,,,,,
+HOLD-012,held_out,,,,,,,,,
+HOLD-013,held_out,,,,,,,,,
+HOLD-014,held_out,,,,,,,,,
+HOLD-015,held_out,,,,,,,,,
+HOLD-016,held_out,,,,,,,,,
+HOLD-017,held_out,,,,,,,,,
+HOLD-018,held_out,,,,,,,,,
+HOLD-019,held_out,,,,,,,,,
+HOLD-020,held_out,,,,,,,,,
+HOLD-021,held_out,,,,,,,,,
+HOLD-022,held_out,,,,,,,,,
+HOLD-023,held_out,,,,,,,,,
+HOLD-024,held_out,,,,,,,,,
+HOLD-025,held_out,,,,,,,,,
+HOLD-026,held_out,,,,,,,,,
+HOLD-027,held_out,,,,,,,,,
+HOLD-028,held_out,,,,,,,,,
+HOLD-029,held_out,,,,,,,,,
+HOLD-030,held_out,,,,,,,,,
+HOLD-031,held_out,,,,,,,,,
+HOLD-032,held_out,,,,,,,,,
+HOLD-033,held_out,,,,,,,,,
+HOLD-034,held_out,,,,,,,,,
+HOLD-035,held_out,,,,,,,,,
+HOLD-036,held_out,,,,,,,,,
+HOLD-037,held_out,,,,,,,,,
+HOLD-038,held_out,,,,,,,,,
+HOLD-039,held_out,,,,,,,,,
+HOLD-040,held_out,,,,,,,,,
+HOLD-041,held_out,,,,,,,,,
+HOLD-042,held_out,,,,,,,,,
+HOLD-043,held_out,,,,,,,,,
+HOLD-044,held_out,,,,,,,,,
+HOLD-045,held_out,,,,,,,,,
+HOLD-046,held_out,,,,,,,,,
+HOLD-047,held_out,,,,,,,,,
+HOLD-048,held_out,,,,,,,,,
+HOLD-049,held_out,,,,,,,,,
+HOLD-050,held_out,,,,,,,,,

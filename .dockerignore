@@ -1,0 +1,10 @@
+.git
+.venv
+**/__pycache__
+**/.pytest_cache
+packguard_app/uploads
+packguard_app/*.db
+packguard_app/reports/*
+packguard_app/fixtures/vision/heldout_real
+packguard_app/.env
+packguard_app/.env.*

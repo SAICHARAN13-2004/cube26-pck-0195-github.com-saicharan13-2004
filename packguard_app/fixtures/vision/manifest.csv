@@ -1,0 +1,13 @@
+fixture_id,split,sku,quantity,image_filename,expected_verdict,expected_decision,notes
+FIX-001,train,SKU-CABLE-USBC,1,SKU-CABLE-USBC_001.jpg,PASS,SEAL,Single item clearly visible on a neutral surface
+FIX-002,train,SKU-BOTTLE-750,1,SKU-BOTTLE-750_001.jpg,PASS,SEAL,Single item clearly visible on a neutral surface
+FIX-003,train,SKU-PUZZLE-500,1,SKU-PUZZLE-500_001.jpg,PASS,SEAL,Single item clearly visible on a neutral surface
+FIX-004,train,SKU-TOWEL-BLU,2,SKU-TOWEL-BLU_002.jpg,PASS,SEAL,Two identical items visible and separated
+FIX-005,train,SKU-CABLE-USBC,0,SKU-CABLE-USBC_missing_001.jpg,FAIL,FIX,Expected cable is absent from the box
+FIX-006,train,SKU-BOTTLE-750,2,SKU-BOTTLE-750_extra_001.jpg,FAIL,FIX,One extra bottle is visible
+FIX-007,validation,SKU-CANDLE-3,1,SKU-CANDLE-3_001.jpg,PASS,SEAL,Single item under normal station lighting
+FIX-008,validation,SKU-LAMP-LED,1,SKU-LAMP-LED_001.jpg,PASS,SEAL,Single item under normal station lighting
+FIX-009,validation,SKU-CABLE-USBC,1,SKU-CABLE-USBC_blurry_001.jpg,UNCERTAIN,RECAPTURE,Image intentionally too blurry to identify safely
+FIX-010,held_out,SKU-PUZZLE-500,1,SKU-PUZZLE-500_heldout_001.jpg,PASS,SEAL,Independent human-labeled evaluation image
+FIX-011,held_out,SKU-TOWEL-BLU,1,SKU-TOWEL-BLU_heldout_001.jpg,FAIL,FIX,Quantity differs from the expected order
+FIX-012,held_out,SKU-SERUM-30,1,SKU-SERUM-30_heldout_001.jpg,UNCERTAIN,MANUAL_REVIEW,Held-out pack image for a known synthetic SKU with no initial fixture reference photo; ambiguous vision should go to manual review

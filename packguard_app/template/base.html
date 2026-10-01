@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}PackGuard{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260928-pastel-mix-1') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/theme-overrides.css', v='20260929-receiving-checks-1') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-main"><a class="brand" href="{{ url_for('dashboard', org_id=active_org) }}"><span class="brand-mark">P</span><span>PackGuard</span></a><button class="menu-toggle" type="button" aria-controls="primary-nav" aria-expanded="false"><b>Menu</b></button><div class="topbar-meta"><span class="live-dot"></span> Pack station online</div><div class="org-switcher"><span>{{ active_org }}</span><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="text-button" type="submit">Log out</button></form></div></div>
+    <nav id="primary-nav" class="topnav" aria-label="Primary navigation"><a class="{{ 'active' if request.endpoint == 'dashboard' else '' }}" href="{{ url_for('dashboard') }}">Dashboard</a><a class="{{ 'active' if request.endpoint == 'alerts' else '' }}" href="{{ url_for('alerts') }}">Alerts</a><a class="{{ 'active' if request.endpoint == 'product_catalog' or request.endpoint == 'product_detail' else '' }}" href="{{ url_for('product_catalog') }}">Catalog</a><a class="{{ 'active' if request.endpoint == 'vision_fixtures_page' or request.endpoint == 'vision_fixture_image' else '' }}" href="{{ url_for('vision_fixtures_page') }}">Vision set</a><a class="{{ 'active' if request.endpoint == 'assistant_page' or request.endpoint == 'assistant_api' else '' }}" href="{{ url_for('assistant_page') }}">Assistant</a><a class="{{ 'active' if request.endpoint == 'support_page' else '' }}" href="{{ url_for('support_page') }}">Support</a></nav>
+    <nav id="primary-nav" class="topnav" aria-label="Primary navigation"><a class="{{ 'active' if request.endpoint == 'dashboard' else '' }}" href="{{ url_for('dashboard') }}">Dashboard</a><a class="{{ 'active' if request.endpoint == 'alerts' else '' }}" href="{{ url_for('alerts') }}">Alerts</a><a class="{{ 'active' if request.endpoint == 'product_catalog' or request.endpoint == 'product_detail' else '' }}" href="{{ url_for('product_catalog') }}">Catalog</a><a class="{{ 'active' if request.endpoint == 'vision_fixtures_page' or request.endpoint == 'vision_fixture_image' else '' }}" href="{{ url_for('vision_fixtures_page') }}">Vision set</a><a class="{{ 'active' if request.endpoint == 'assistant_page' or request.endpoint == 'assistant_api' else '' }}" href="{{ url_for('assistant_page') }}">Assistant</a><a class="{{ 'active' if request.endpoint == 'support_page' else '' }}" href="{{ url_for('support_page') }}">Support</a></nav>
+  </header>
+  <main class="shell">{% block content %}{% endblock %}</main>
+  <footer class="footer"><span>Evidence-first outbound checks</span><span class="footer-links"><a href="{{ url_for('records_api') }}">Export JSON</a><a href="{{ url_for('records_csv') }}">Export CSV</a><a href="{{ url_for('evaluation_summary') }}">Evaluation summary</a></span></footer>
+  <script>
+    const menuToggle = document.querySelector('.menu-toggle');
+    const primaryNav = document.getElementById('primary-nav');
+    menuToggle?.addEventListener('click', () => {
+      const isOpen = primaryNav.classList.toggle('is-open');
+      menuToggle.setAttribute('aria-expanded', String(isOpen));
+      menuToggle.classList.toggle('is-open', isOpen);
+    });
+  </script>
+</body>
+</html>

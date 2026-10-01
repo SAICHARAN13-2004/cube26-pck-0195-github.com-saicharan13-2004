@@ -1,0 +1,239 @@
+{% extends "base.html" %}
+{% block title %}CUBE contract capture · PackGuard{% endblock %}
+{% block content %}
+<section class="page-head compact"><div><a class="back-link" href="{{ url_for('dashboard') }}">← Dashboard</a><p class="eyebrow">CUBE · Evidence Contract 1.1</p><h1>Capture pack evidence</h1><p class="lede">Capture two guided views; add a detail view when needed. Evidence uploads directly to private storage.</p></div></section>
+<form id="contract-capture-form" class="capture-layout" novalidate>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <section class="form-panel">
+    <div class="panel-title"><span class="step">01</span><div><h2>Order and shipment</h2><p>Pack evidence is recorded against the outbound order.</p></div></div>
+    <div class="form-grid">
+      <label>Order ID<input name="order_id" required autocomplete="off"></label>
+      <label>Shipment ID <span class="optional">when available</span><input name="shipment_id" autocomplete="off"></label>
+      <label>SKU<input name="sku" required autocomplete="off"></label>
+      <label>ASIN <span class="optional">optional</span><input name="asin" autocomplete="off"></label>
+    </div>
+    <div class="form-grid">
+      <label>Expected quantity<input name="quantity_expected" type="number" min="0" step="1" required></label>
+      <label>Observed quantity <span class="optional">leave blank if uncertain</span><input name="quantity_observed" type="number" min="0" step="1"></label>
+    </div>
+    <label>Observed SKU <span class="optional">leave blank if uncertain</span><input name="observed_sku" autocomplete="off"></label>
+  </section>
+  <section class="form-panel">
+    <div class="panel-title"><span class="step">02</span><div><h2>Guided images</h2><p>Use the rear camera and keep the full package visible.</p></div></div>
+    {% if not direct_upload_enabled %}<div class="catalog-error">Direct evidence uploads are unavailable until private S3-compatible storage is configured. Image bytes are never routed through the application server.</div>{% endif %}
+    <div class="camera-guidance"><strong>Shot 1 · Overview</strong><span>Frame the open carton and all items. Keep items separated and show the box edges.</span></div>
+    <div class="camera-guidance"><strong>Shot 2 · Labels</strong><span>Show the SKU or product labels clearly, without covering the contents.</span></div>
+    <div class="camera-guidance"><strong>Shot 3 · Detail · optional</strong><span>Use this for a hidden, damaged, or ambiguous item.</span></div>
+    <div class="camera-controls"><button id="contract-camera-start" class="button button-secondary" type="button">📷 Open rear camera</button><span id="contract-camera-status" role="status">Camera requires HTTPS or localhost.</span></div>
+    <video id="contract-camera-video" autoplay muted playsinline hidden style="width:100%;max-height:420px;object-fit:contain"></video>
+    <div class="camera-controls">
+      <button class="button button-secondary contract-shot" data-slot="overview" type="button" disabled>Capture overview</button>
+      <button class="button button-secondary contract-shot" data-slot="labels" type="button" disabled>Capture labels</button>
+      <button class="button button-secondary contract-shot" data-slot="detail" type="button" disabled>Capture detail</button>
+      <button id="contract-camera-stop" class="button button-secondary" type="button" disabled>Close camera</button>
+    </div>
+    <div id="contract-shot-list" class="checks" aria-live="polite"></div>
+    <label>Add image files <span class="optional">JPEG, PNG, or WEBP · up to three total</span><input id="contract-files" type="file" accept="image/jpeg,image/png,image/webp" multiple></label>
+    <button id="contract-submit" class="button button-primary button-wide" type="submit"{% if not direct_upload_enabled %} disabled{% endif %}>Upload and save evidence</button>
+    <button id="contract-retry" class="button button-secondary button-wide" type="button" hidden>Retry failed uploads</button>
+    <p id="contract-status" role="status" aria-live="polite"></p>
+  </section>
+</form>
+<section id="contract-record-panel" class="form-panel" hidden><div class="panel-title"><span class="step">03</span><div><h2>Evidence record</h2><p id="contract-record-summary"></p></div></div><div id="contract-checks" class="checks"></div><button id="contract-refresh" class="button button-secondary" type="button">Refresh assessment</button></section>
+<script>
+const contractForm = document.getElementById('contract-capture-form');
+const csrfToken = contractForm.elements.csrf_token.value;
+const cameraVideo = document.getElementById('contract-camera-video');
+const cameraStatus = document.getElementById('contract-camera-status');
+const shotList = document.getElementById('contract-shot-list');
+const submitButton = document.getElementById('contract-submit');
+const retryButton = document.getElementById('contract-retry');
+const statusText = document.getElementById('contract-status');
+const fileInput = document.getElementById('contract-files');
+const recordPanel = document.getElementById('contract-record-panel');
+const recordSummary = document.getElementById('contract-record-summary');
+const checkList = document.getElementById('contract-checks');
+const shots = new Map();
+let cameraStream = null;
+let activeCapture = null;
+let activeRecordId = null;
+let capturedAt = null;
+const slotLabels = {overview: 'Overview', labels: 'Labels', detail: 'Detail'};
+const contentTypeByExtension = {jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp'};
+
+function showStatus(message) { statusText.textContent = message; }
+function renderShots() {
+  shotList.replaceChildren();
+  for (const [slot, item] of shots) {
+    const row = document.createElement('div');
+    row.className = 'check-row';
+    const image = document.createElement('img');
+    image.src = URL.createObjectURL(item.blob);
+    image.alt = `${slotLabels[slot]} capture preview`;
+    image.style.width = '72px'; image.style.height = '72px'; image.style.objectFit = 'cover';
+    const label = document.createElement('strong'); label.textContent = `${slotLabels[slot]} · ${item.blob.size} bytes`;
+    row.append(image, label); shotList.append(row);
+  }
+}
+async function openCamera() {
+  try {
+    cameraStream = await navigator.mediaDevices.getUserMedia({video: {facingMode: {ideal: 'environment'}}, audio: false});
+    cameraVideo.srcObject = cameraStream; cameraVideo.hidden = false;
+    document.querySelectorAll('.contract-shot').forEach((button) => { button.disabled = false; });
+    document.getElementById('contract-camera-stop').disabled = false;
+    cameraStatus.textContent = 'Rear camera ready.';
+  } catch (error) {
+    cameraStatus.textContent = `Camera unavailable (${error.name}). Choose image files below; evidence capture can continue.`;
+  }
+}
+function closeCamera() {
+  cameraStream?.getTracks().forEach((track) => track.stop()); cameraStream = null;
+  cameraVideo.srcObject = null; cameraVideo.hidden = true;
+  document.querySelectorAll('.contract-shot').forEach((button) => { button.disabled = true; });
+  document.getElementById('contract-camera-stop').disabled = true;
+}
+async function captureShot(slot) {
+  if (!cameraStream || !cameraVideo.videoWidth) { cameraStatus.textContent = 'Camera is not ready yet.'; return; }
+  const canvas = document.createElement('canvas');
+  canvas.width = cameraVideo.videoWidth; canvas.height = cameraVideo.videoHeight;
+  canvas.getContext('2d').drawImage(cameraVideo, 0, 0);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.88));
+  if (!blob) { cameraStatus.textContent = 'Could not encode this image. Retry the shot.'; return; }
+  shots.set(slot, {blob, takenAt: new Date().toISOString(), contentType: 'image/jpeg'});
+  renderShots();
+  cameraStatus.textContent = `${slotLabels[slot]} captured.`;
+}
+document.getElementById('contract-camera-start').addEventListener('click', openCamera);
+document.getElementById('contract-camera-stop').addEventListener('click', closeCamera);
+document.querySelectorAll('.contract-shot').forEach((button) => button.addEventListener('click', () => captureShot(button.dataset.slot)));
+fileInput.addEventListener('change', () => {
+  for (const file of fileInput.files) {
+    if (shots.size >= 3) break;
+    const extension = file.name.split('.').pop().toLowerCase();
+    const contentType = contentTypeByExtension[extension];
+    if (!contentType || (file.type && file.type !== contentType)) continue;
+    const slot = !shots.has('overview') ? 'overview' : !shots.has('labels') ? 'labels' : !shots.has('detail') ? 'detail' : null;
+    if (slot) shots.set(slot, {blob: file, takenAt: new Date(file.lastModified || Date.now()).toISOString(), contentType});
+  }
+  renderShots();
+  if (shots.size >= 3) fileInput.disabled = true;
+});
+
+function numberOrNull(value) { if (value === '') return null; const result = Number(value); return Number.isInteger(result) && result >= 0 ? result : NaN; }
+function validateInputs() {
+  const orderId = contractForm.elements.order_id.value.trim();
+  const sku = contractForm.elements.sku.value.trim();
+  const expected = numberOrNull(contractForm.elements.quantity_expected.value);
+  const observed = numberOrNull(contractForm.elements.quantity_observed.value);
+  const observedSku = contractForm.elements.observed_sku.value.trim();
+  if (!orderId || !sku || Number.isNaN(expected) || Number.isNaN(observed)) throw new Error('Enter an order, SKU, and valid whole-number quantities.');
+  if (observed !== null && !observedSku) throw new Error('Enter the observed SKU or leave both observed fields blank.');
+  if ((observed === null) !== (!observedSku)) throw new Error('Observed SKU and observed quantity must be supplied together.');
+  if (!shots.has('overview') || !shots.has('labels')) throw new Error('Capture both the overview and labels shots before submitting.');
+  return {orderId, sku, expected, observed, observedSku};
+}
+async function putWithRetry(item, shot) {
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(item.url, {method: 'PUT', headers: item.headers, body: shot.blob});
+      if (!response.ok) throw new Error(`Upload returned HTTP ${response.status}`);
+      return;
+    } catch (error) {
+      lastError = error;
+      showStatus(`${slotLabels[item.slot]} upload attempt ${attempt + 1} failed. Retrying...`);
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}
+async function createPendingCapture(values) {
+  const imageSlots = Array.from(shots, ([slot, image]) => ({slot, content_type: image.contentType}));
+  const observedContents = values.observed === null ? '' : `${values.observedSku}:${values.observed}`;
+  const response = await fetch('/v1/captures', {
+    method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+    body: JSON.stringify({
+      agent: 'pack', client_id: null,
+      subject: {type: 'order', asin: contractForm.elements.asin.value.trim() || null, sku: values.sku, order_id: values.orderId, po_line_id: null, shipment_id: contractForm.elements.shipment_id.value.trim() || null, quantity_expected: values.expected, quantity_observed: values.observed},
+      image_slots: imageSlots, expected_lines: `${values.sku}:${values.expected}`, observed_contents: observedContents,
+    }),
+  });
+  if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || `Capture creation failed (${response.status}).`); }
+  return response.json();
+}
+async function uploadAndComplete() {
+  if (!activeCapture) {
+    showStatus('Creating capture. You can leave this screen if the connection is slow; vision never blocks completion.');
+    activeCapture = await createPendingCapture(validateInputs());
+  }
+  for (const item of activeCapture.upload_urls) {
+    const shot = shots.get(item.slot);
+    if (shot.uploaded) continue;
+    showStatus(`Uploading ${slotLabels[item.slot]} directly to private storage...`);
+    await putWithRetry(item, shot);
+    shot.uploaded = true;
+  }
+  showStatus('Saving evidence record. Assessment continues in the background.');
+  const response = await fetch(`/v1/captures/${activeCapture.capture_id}/complete`, {
+    method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+    body: JSON.stringify({images: activeCapture.upload_urls.map((item) => ({key: item.key, taken_at: shots.get(item.slot).takenAt}))}),
+  });
+  if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || `Could not save evidence (${response.status}); retry is available.`); }
+  const result = await response.json();
+  activeRecordId = result.record_id;
+  recordPanel.hidden = false;
+  recordSummary.replaceChildren();
+  const link = document.createElement('a'); link.href = `/v1/records/${result.record_id}`; link.target = '_blank'; link.rel = 'noopener'; link.textContent = `Open read-only record ${result.record_id}`;
+  recordSummary.append(link, document.createTextNode(` · status ${result.status}`));
+  statusText.replaceChildren(document.createTextNode('Evidence saved; operator may continue. Vision is processing asynchronously. '));
+  const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'button button-secondary'; retry.textContent = 'Refresh record'; retry.addEventListener('click', refreshRecord); statusText.append(retry);
+  renderRecord({checks: [], status: result.status});
+  submitButton.hidden = true; retryButton.hidden = true;
+  closeCamera();
+}
+function renderRecord(record) {
+  checkList.replaceChildren();
+  if (!record.checks.length) { const message = document.createElement('p'); message.textContent = 'Record is pending vision. You can continue work; refresh to see the result.'; checkList.append(message); return; }
+  for (const check of record.checks) {
+    const row = document.createElement('div'); row.className = 'check-row';
+    const detail = document.createElement('div');
+    const title = document.createElement('strong'); title.textContent = `${check.check_key} · ${check.verdict}`;
+    const reason = document.createElement('span'); reason.textContent = JSON.stringify(check.detail);
+    detail.append(title, reason); row.append(detail);
+    if (check.detail?.agent_run) {
+      const run = check.detail.agent_run;
+      const handoff = document.createElement('span');
+      handoff.textContent = `Agent handoff: ${(run.agents || []).join(' → ')} · next action: ${run.tool_call?.name || 'none'} · ${run.status}`;
+      row.append(handoff);
+    }
+    const reasonInput = document.createElement('input'); reasonInput.placeholder = 'Required override reason'; reasonInput.required = true; reasonInput.setAttribute('aria-label', `Reason for overriding ${check.check_key}`);
+    row.append(reasonInput);
+    for (const verdict of ['pass', 'fail', 'uncertain']) {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'button button-secondary'; button.textContent = `Override: ${verdict}`;
+      button.addEventListener('click', async () => {
+        const reasonValue = reasonInput.value.trim(); if (!reasonValue) { reasonInput.reportValidity(); return; }
+        const response = await fetch(`/v1/records/${activeRecordId}/overrides`, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken}, body: JSON.stringify({check_key: check.check_key, to_verdict: verdict, reason: reasonValue})});
+        showStatus(response.ok ? `Override saved for ${check.check_key}.` : 'Override could not be saved. Refresh the record and retry.');
+      }); row.append(button);
+    }
+    checkList.append(row);
+  }
+}
+async function refreshRecord() {
+  if (!activeRecordId) return;
+  const response = await fetch(`/v1/records/${activeRecordId}`);
+  if (!response.ok) { showStatus('Record refresh failed; retry when connected.'); return; }
+  const record = await response.json(); renderRecord(record);
+  recordSummary.lastChild.textContent = ` · status ${record.status}`;
+  showStatus(record.status === 'pending' ? 'Vision is still pending; the pack record is saved and you can continue.' : 'Evidence assessment refreshed.');
+}
+contractForm.addEventListener('submit', async (event) => {
+  event.preventDefault(); submitButton.disabled = true;
+  try { await uploadAndComplete(); }
+  catch (error) { showStatus(`${error.message} Use Retry failed uploads to continue without retaking successful shots.`); retryButton.hidden = false; }
+  finally { submitButton.disabled = false; }
+});
+retryButton.addEventListener('click', uploadAndComplete);
+document.getElementById('contract-refresh').addEventListener('click', refreshRecord);
+</script>
+{% endblock %}
