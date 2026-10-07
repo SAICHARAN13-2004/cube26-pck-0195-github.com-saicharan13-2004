@@ -48,7 +48,7 @@ PackGuard uses Ollama and the local `qwen3:1.7b` model. It does not connect to O
 ollama pull qwen3:1.7b
 ```
 
-Pack inspection uses a separate vision model, `gemma3:4b` by default. Download it as well:
+Pack inspection uses local Ollama vision models. For a single expected SKU with no typed observation, PackGuard defaults to `moondream:1.8b` for a fast image-based presence hint. Structured SKU/quantity assessment uses `gemma3:4b` unless `PACKGUARD_CONTRACT_VISION_MODEL` is set. Download the model(s) needed for your workflow:
 
 ```powershell
 ollama pull gemma3:4b
@@ -59,15 +59,15 @@ Start Ollama before starting PackGuard. `OLLAMA_MODEL` selects the chat assistan
 ## Use
 
 1. Select a workspace to exercise tenant isolation.
-2. Open **Catalog** and add or review organization-specific SKUs, variants, barcode IDs, and reference photos. Synthetic sample SKUs are seeded from the reference CSV and are not ground-truth training data.
-3. Open **New check**, select expected catalog products or enter expected lines using `SKU:quantity;SKU:quantity`.
-4. Use **Open camera** on a supported secure browser, or use the photo file input on a phone or computer. PackGuard's local vision agent can suggest visible SKUs, quantities, image quality, and a next action; operators can also enter observed contents manually.
+2. Open **Catalog** and add or review organization-specific SKUs, Product IDs, variants, barcode IDs, supplier, source/arrival address, recipient, destination address, and reference photos. These logistics fields are catalog defaults and must be entered from trusted shipment/order data; product images do not reveal addresses. Synthetic sample SKUs are seeded from the reference CSV and are not ground-truth training data.
+3. Open **New check** and search by product name, Product ID, SKU, or barcode. Selecting a product fills its SKU and shows the saved logistics route. Product-only checks use expected quantity 1 as a starting value; change it when the real order quantity is known. External order IDs remain optional; a local check ID is generated if none is supplied.
+4. Use **Open camera** on a supported secure browser, or use the photo file input on a phone or computer. With observed contents blank, a photo is required for the vision agent to inspect. The agent records detected products and a candidate action; presence-only inference never invents quantities.
 5. Review the deterministic decision and evidence record.
 6. Consume `/api/records` for downstream integration.
 
 ### CUBE Evidence Contract 1.1
 
-The **CUBE contract capture** page and `/v1` API implement the fixed 1.1 record shape for this Pack Manager pod. The capture API accepts only `agent=pack`; the other three manager pods are outside this application's scope. The Pack check keys are published here and must remain stable:
+The **CUBE contract capture** page and `/v1` API implement the fixed 1.1 record shape for this Pack Manager pod. The operator capture API writes `agent=pack` records; the machine integration accepts `agent=prep` records and exposes the resulting `agent=pack` records to downstream agents. The Pack check keys are published here and must remain stable:
 
 | `check_key` | Meaning |
 | --- | --- |
@@ -76,13 +76,26 @@ The **CUBE contract capture** page and `/v1` API implement the fixed 1.1 record 
 
 Capture requires guided `overview` and `labels` shots, with an optional `detail` shot. Images upload directly to private S3-compatible storage using short-lived presigned URLs. The capture page and override action require an authenticated operator; a UUID record link and its image links are read-only and can be shared. `/v1/records` is organization-scoped and paginated, with `since` filtered against UTC `captured_at` values.
 
+When a single expected SKU is supplied and observed contents are blank, the default fast path uses Moondream for product-presence recognition. It cannot count units; the result stays `MANUAL_REVIEW` unless a quantity-capable structured model is explicitly configured and returns a clear candidate. Clear structured mismatches can route to `FIX`. A `SEAL` candidate always remains under operator confirmation while vision is uncalibrated; automatic sealing stays disabled. Supplier and route fields come from catalog metadata and show as not recorded when absent; they are not inferred from product images.
+
 The record starts as `pending` and remains available if vision times out or fails. The model is called once with every shot; latency and returned token usage are stored under `checks[].detail` for the visual check. A failed call leaves the record pending for recovery and does not block the operator. PostgreSQL tenant tables, including contract captures, records, and overrides, use enabled and forced row-level security; images are private and reached through record-scoped routes.
 
 After the vision response, a bounded agent workflow hands evidence to deterministic verification and then to a coordinator that selects and records a next action such as recapture, correction, or operator review. The capture UI displays the agent handoff and selected action. This workflow cannot seal an order or control external warehouse systems; operators keep final authority. See [ARCHITECTURE.md](ARCHITECTURE.md#bounded-agentic-pack-workflow) for its decision boundaries.
 
+### Prep and returns agent integration
+
+Configure `PACKGUARD_AGENT_API_ORG_ID`, `PACKGUARD_PREP_AGENT_TOKEN`, and `PACKGUARD_PACK_FEED_TOKEN` in the PackGuard process environment. The organization ID must match the target workspace. Use separate random bearer tokens of at least 32 characters; give the prep agent only the prep token and the downstream returns agent only the pack-feed token. Do not put tokens in source control or URLs.
+
+- `POST /v1/agent/records` accepts a complete CUBE 1.1 `agent=prep` record as JSON with `Authorization: Bearer <prep-token>`. The record must belong to the configured organization, have passing checks, and reference evidence images available in PackGuard's configured private storage with matching byte counts and SHA-256 digests. Identical retries are safe; reusing a record ID with different content is rejected.
+- Include route fields in a prep check's `detail.logistics`: `supplier_name`, `origin_address`, `ordered_for`, and `delivery_address`. New Check opens with `/capture?prep_record_id=<prep-record-uuid>`, loads the order/SKU/quantity and logistics from that record, rejects modified expected quantities or shipment IDs, and saves the prep record ID on the Pack evidence.
+- A New Check started from a prep record also writes a CUBE `agent=pack` record and publishes it to the returns webhook/feed. It does not require typed observed contents, but an open-box photo is required for image-based inspection.
+- `GET /v1/agent/records?agent=pack&limit=50` returns paginated CUBE `agent=pack` records with `Authorization: Bearer <pack-feed-token>`. Use the returned `next_cursor` for subsequent pages or `since=<UTC timestamp>` for incremental polling. The output's `sku_quantity.detail.source_prep_record_id` links it to its prep input.
+- To push results immediately, also configure `PACKGUARD_RETURNS_AGENT_URL` and `PACKGUARD_RETURNS_AGENT_TOKEN` together. After assessment is persisted, PackGuard POSTs the complete CUBE pack record as JSON with `Authorization: Bearer <returns-token>` and `Idempotency-Key: <record_id>`. The receiving agent should deduplicate by record ID; if delivery fails, PackGuard logs a warning and the authenticated pack feed remains available. Production webhook URLs must use HTTPS.
+- Pack capture still needs stage-3 overview and label images of the actual open outbound box. Prep images are retained as upstream evidence and are not treated as proof of the outbound box contents.
+
 ## Honest scope
 
-The regular New check flow uses the deterministic verifier on operator-entered SKU/quantity observations. Uploaded photos can receive an uncalibrated vision suggestion, shown as supporting evidence; they do not override a valid manual comparison or authorize `SEAL`. Photos and videos remain attached to the record. A matching result requires the operator to select `Seal` before the product decision becomes `SEAL`; a mismatch produces `FAIL`, and missing or malformed observations produce `UNCERTAIN`. The separate CUBE contract capture path supports its own asynchronous vision assessment. The supplied CSV is demo data, not production ground truth.
+The regular New check flow uses the deterministic verifier on operator-entered SKU/quantity observations. The CUBE contract flow can run from images without typed observed contents, but the fast presence model cannot verify quantity. All image results are uncalibrated; `SEAL` is a candidate only and requires operator confirmation. Photos and videos remain attached to the record. The supplied CSV is demo data, not production ground truth.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the boundaries and production hardening plan.
 

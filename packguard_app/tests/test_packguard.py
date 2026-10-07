@@ -5,6 +5,7 @@ from io import BytesIO
 from unittest.mock import patch
 from PIL import Image
 
+import app as packguard_app
 from app import app
 from database import get_record
 from evaluate_vision import evaluate_predictions, validate_double_labeled_holdout
@@ -14,11 +15,24 @@ from vision import inspect_image
 from policy import auto_seal_policy, require_operator_confirmation
 from production import readiness_report
 from agent import assess_pack, enforce_component_verdict
+from orchestrator import run_pack_agent_workflow
 from evaluation import summarize_records
 
 
 def login(client, username="alpha.operator", password="alpha-demo"):
     return client.post("/login", data={"username": username, "password": password})
+
+
+def test_vision_catalog_prioritizes_expected_skus_without_dropping_decoys(monkeypatch):
+    products = [
+        {"sku": "SKU-DECOY", "product_name": "Decoy item"},
+        {"sku": "SKU-EXPECTED", "product_name": "Expected item"},
+    ]
+    monkeypatch.setattr(packguard_app, "catalog_products", lambda _org_id: products)
+
+    result = packguard_app.vision_catalog_products("org_demo_alpha", {"SKU-EXPECTED"})
+
+    assert [product["sku"] for product in result] == ["SKU-EXPECTED", "SKU-DECOY"]
 
 
 def test_verifier_returns_three_way_decision():
@@ -121,6 +135,10 @@ def test_product_catalog_is_tenant_scoped_and_stores_variants_and_reference_imag
             "brand": "Demo brand",
             "external_id": "EXT-100",
             "barcode": "00012345678905",
+            "supplier_name": "Demo supplier",
+            "origin_address": "10 Supplier Way, Reno, NV",
+            "ordered_for": "North Shop",
+            "delivery_address": "20 Retail Road, Sacramento, CA",
             "attributes": '{"color":"blue","size":"750ml"}',
             "reference_image": (BytesIO(b"fake-image"), "bottle.png"),
         },
@@ -133,7 +151,25 @@ def test_product_catalog_is_tenant_scoped_and_stores_variants_and_reference_imag
     created = next(product for product in alpha_products if product["sku"] == "SKU-CATALOG-TEST")
     assert created["attributes"] == {"color": "blue", "size": "750ml"}
     assert created["reference_image_ref"].startswith("org_demo_alpha/catalog/")
+    assert created["supplier_name"] == "Demo supplier"
+    assert created["origin_address"] == "10 Supplier Way, Reno, NV"
+    assert created["ordered_for"] == "North Shop"
+    assert created["delivery_address"] == "20 Retail Road, Sacramento, CA"
     assert "SKU-CATALOG-TEST" not in {product["sku"] for product in bravo_products}
+
+    prefills = alpha_client.get(f"/capture?product_id={created['product_id']}")
+    assert prefills.status_code == 200
+    assert created["product_id"].encode() in prefills.data
+    assert b"SKU-CATALOG-TEST:1" in prefills.data
+    assert b"10 Supplier Way, Reno, NV" in prefills.data
+    assert b"20 Retail Road, Sacramento, CA" in prefills.data
+    name_prefill = alpha_client.get("/capture?product=Demo%20bottle")
+    assert name_prefill.status_code == 200
+    assert created["product_id"].encode() in name_prefill.data
+    assert b"SKU-CATALOG-TEST:1" in name_prefill.data
+    detail_page = alpha_client.get("/catalog/product/SKU-CATALOG-TEST")
+    assert b"Demo supplier" in detail_page.data
+    assert b"North Shop" in detail_page.data
 
     check_response = alpha_client.post(
         "/capture",
@@ -141,6 +177,7 @@ def test_product_catalog_is_tenant_scoped_and_stores_variants_and_reference_imag
             "unit_id": "UNIT-CATALOG-CHECK",
             "order_id": "ORD-CATALOG-CHECK",
             "operator_id": "alpha.operator",
+            "selected_product_id": created["product_id"],
             "order_lines": "SKU-CATALOG-TEST:1",
             "observed_in_box": "SKU-CATALOG-TEST:1",
         },
@@ -152,6 +189,98 @@ def test_product_catalog_is_tenant_scoped_and_stores_variants_and_reference_imag
     created_check = next(item for item in check_api if item["unit_id"] == "UNIT-CATALOG-CHECK")
     assert created_check["evidence"]["checks"][0]["product"]["name"] == "Demo bottle"
     assert created_check["evidence"]["checks"][0]["product"]["attributes"] == {"color": "blue", "size": "750ml"}
+    assert created_check["origin_address"] == "10 Supplier Way, Reno, NV"
+    assert created_check["delivery_address"] == "20 Retail Road, Sacramento, CA"
+    assert created_check["evidence"]["source"]["product_routes"][0]["ordered_for"] == "North Shop"
+    assert b"10 Supplier Way, Reno, NV" in check_record.data
+    assert b"20 Retail Road, Sacramento, CA" in check_record.data
+
+
+def test_single_sku_image_capture_uses_fast_presence_agent_without_manual_observation(monkeypatch):
+    client = app.test_client()
+    login(client)
+    product = next(
+        item for item in client.get("/api/products").get_json()["products"]
+        if item["sku"] == "SKU-CABLE-USBC"
+    )
+    captured = {}
+
+    def fake_inspection(_photo, **kwargs):
+        captured.update(kwargs)
+        return {
+            "status": "SUGGESTIONS_READY_UNCALIBRATED",
+            "provider": "test:moondream",
+            "presence_hint": "MATCH",
+            "detected_items": [{"sku": "SKU-CABLE-USBC", "quantity": None}],
+            "extra_items": [],
+            "image_quality": {"status": "UNKNOWN"},
+            "uncertainties": ["Presence only; quantity is unknown."],
+        }
+
+    monkeypatch.setattr("app.inspect_image", fake_inspection)
+    monkeypatch.delenv("PACKGUARD_VISION_MODEL", raising=False)
+    image = BytesIO()
+    Image.new("RGB", (24, 24), "white").save(image, format="JPEG")
+    response = client.post(
+        "/capture",
+        data={
+            "selected_product_id": product["product_id"],
+            "observed_in_box": "",
+            "photo": (image, "open-box.jpg"),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 302
+    assert captured["model_override"] == "moondream:1.8b"
+    assert captured["force_structured"] is False
+    assert [candidate["sku"] for candidate in captured["catalog_products"]] == ["SKU-CABLE-USBC"]
+    record_id = response.headers["Location"].rstrip("/").split("/")[-1].split("?")[0]
+    saved = next(item for item in client.get("/api/records").get_json()["records"] if item["record_id"] == record_id)
+    assert saved["order_lines"] == "SKU-CABLE-USBC:1"
+    assert saved["order_id"].startswith("ORD-LOCAL-")
+    assert saved["unit_id"].startswith("UNIT-")
+    record_page = client.get(response.headers["Location"])
+    assert b"Product presence" in record_page.data
+    assert b"quantity not determined" in record_page.data
+    assert b"Agent candidate" in record_page.data
+
+
+def test_new_check_routes_clear_wrong_sku_image_to_fix_without_typed_observation(monkeypatch):
+    client = app.test_client()
+    login(client)
+    monkeypatch.setattr("app.inspect_image", lambda *_args, **_kwargs: {
+        "status": "SUGGESTIONS_READY_UNCALIBRATED",
+        "provider": "test:structured-vision",
+        "detected_items": [{"sku": "SKU-BOTTLE-750", "quantity": 1, "confidence": 0.98, "variant_match": True}],
+        "extra_items": [],
+        "image_quality": {"status": "GOOD", "score": 0.98},
+        "occlusion": {"status": "CLEAR"},
+        "uncertainties": [],
+        "confidence": 0.98,
+    })
+    photo = BytesIO()
+    Image.new("RGB", (24, 24), "white").save(photo, format="JPEG")
+    response = client.post(
+        "/capture",
+        data={
+            "unit_id": "UNIT-AUTO-WRONG-001",
+            "order_id": "ORD-AUTO-WRONG-001",
+            "operator_id": "alpha.operator",
+            "order_lines": "SKU-CABLE-USBC:1",
+            "observed_in_box": "",
+            "photo": (photo, "open-box.jpg"),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 302
+    record_id = response.headers["Location"].rstrip("/").split("/")[-1].split("?")[0]
+    saved = next(item for item in client.get("/api/records").get_json()["records"] if item["record_id"] == record_id)
+    assert saved["verdict"] == "FAIL"
+    assert saved["action"] == "STOP_AND_FIX"
+    assert saved["evidence"]["decision"] == "FIX"
+    assert saved["evidence"]["source"]["inspection"]["candidate_decision"] == "FIX"
 
 
 def test_catalog_names_are_distinct_from_sku_and_dashboard_search_is_scoped():
@@ -202,10 +331,13 @@ def test_capture_uses_catalog_picker_and_phone_rear_camera():
     response = client.get("/capture")
 
     assert response.status_code == 200
-    assert b"catalog-select" in response.data
+    assert b'id="product-lookup"' in response.data
+    assert b"Product name or Product ID" in response.data
+    assert b'<textarea name="observed_in_box"' not in response.data
+    assert b"demo-preset" not in response.data
     assert b'capture="environment"' in response.data
     assert b"camera-capture" in response.data
-    assert b"Before capture" in response.data
+    assert b"agent starts automatically" in response.data
 
 
 def test_capture_persists_evidence():
@@ -391,6 +523,70 @@ def test_assistant_answers_from_logged_in_organization():
     assert response.status_code == 200
     assert "active alerts" in response.get_json()["answer"]
 
+
+def test_assistant_agent_network_answer_uses_live_workflow_counts():
+    client = app.test_client()
+    login(client)
+    response = client.post(
+        "/api/assistant",
+        json={"question": "What is the agent network status?"},
+    )
+
+    assert response.status_code == 200
+    answer = response.get_json()["answer"]
+    assert "Stage-2 prep record(s)" in answer
+    assert "Stage-3 pack record(s)" in answer
+    assert "Stage-4 webhook is" in answer
+    assert "Dispatch complete" not in answer
+
+
+def test_assistant_answers_product_questions_from_tenant_catalog():
+    client = app.test_client()
+    login(client)
+    client.post(
+        "/catalog",
+        data={
+            "sku": "SKU-CABLE-USBC",
+            "product_name": "USB-C cable",
+            "supplier_name": "Cable supplier",
+            "origin_address": "12 Factory Lane, Reno, NV",
+            "ordered_for": "Online retail",
+            "delivery_address": "34 Store Road, Sacramento, CA",
+            "attributes": "{}",
+        },
+    )
+    response = client.post(
+        "/api/assistant",
+        json={"question": "What is SKU-CABLE-USBC?"},
+    )
+
+    assert response.status_code == 200
+    answer = response.get_json()["answer"]
+    assert "USB-C cable" in answer
+    assert "Product ID PRD-" in answer
+    assert "Cable supplier" in answer
+    assert "12 Factory Lane, Reno, NV" in answer
+    assert "Online retail" in answer
+    assert "34 Store Road, Sacramento, CA" in answer
+    assert "not a visual confirmation" in answer
+
+    product = next(
+        item for item in client.get("/api/products").get_json()["products"]
+        if item["sku"] == "SKU-CABLE-USBC"
+    )
+    current_page_response = client.post(
+        "/api/assistant",
+        json={
+            "question": "Where should this go?",
+            "page_context": {
+                "current_page": {"path": "/capture", "title": "New check"},
+                "form_fields": {"selected_product_id": product["product_id"], "password": "must not be shared"},
+            },
+        },
+    )
+    assert current_page_response.status_code == 200
+    assert "34 Store Road, Sacramento, CA" in current_page_response.get_json()["answer"]
+
     def test_support_request_is_persisted_and_tenant_scoped():
         alpha_client = app.test_client()
         bravo_client = app.test_client()
@@ -423,8 +619,10 @@ def test_assistant_is_available_on_separate_page_not_dashboard():
     assistant_page = client.get("/assistant")
 
     assert dashboard.status_code == 200
-    assert b"assistant-chat" not in dashboard.data
-    assert b'href="/assistant"' in dashboard.data
+    assert b'id="global-assistant-chat"' in dashboard.data
+    assert b'id="assistant-chat"' not in dashboard.data
+    assert b'aria-label="Open assistant"' in dashboard.data
+    assert b'href="/assistant"' not in dashboard.data
     assert assistant_page.status_code == 200
     assert b"assistant-chat" in assistant_page.data
 
@@ -1130,6 +1328,108 @@ def test_moondream_routes_multiple_expected_skus_to_manual_review(tmp_path, monk
         operator_observation="",
     )
     assert assessment["recommendation"] == "MANUAL_REVIEW"
+
+
+def test_image_only_clear_match_emits_seal_candidate_but_not_final_seal():
+    workflow = run_pack_agent_workflow(
+        {
+            "status": "SUGGESTIONS_READY_UNCALIBRATED",
+            "detected_items": [{"sku": "SKU-A", "quantity": 1, "confidence": 0.96, "variant_match": True}],
+            "extra_items": [],
+            "image_quality": {"status": "GOOD"},
+            "occlusion": {"status": "CLEAR"},
+            "uncertainties": [],
+            "confidence": 0.96,
+            "calibration_status": "UNVALIDATED",
+        },
+        expected_lines="SKU-A:1",
+        observed_contents="",
+    )
+
+    assert workflow["candidate_decision"] == "SEAL"
+    assert workflow["decision"] == "manual_review"
+    assert workflow["action"] == "request_operator_confirmation"
+    assert workflow["trace"]["decision_basis"]["automatic_seal_authorized"] is False
+
+
+def test_image_only_clear_mismatch_routes_to_fix_candidate():
+    workflow = run_pack_agent_workflow(
+        {
+            "status": "SUGGESTIONS_READY_UNCALIBRATED",
+            "detected_items": [{"sku": "SKU-B", "quantity": 1, "confidence": 0.96, "variant_match": True}],
+            "extra_items": [],
+            "image_quality": {"status": "GOOD"},
+            "occlusion": {"status": "CLEAR"},
+            "uncertainties": [],
+            "confidence": 0.96,
+            "calibration_status": "UNVALIDATED",
+        },
+        expected_lines="SKU-A:1",
+        observed_contents="",
+    )
+
+    assert workflow["candidate_decision"] == "FIX"
+    assert workflow["decision"] == "fix"
+    assert workflow["action"] == "open_fix_workflow"
+
+
+def test_presence_only_model_never_infers_quantity_or_seal():
+    workflow = run_pack_agent_workflow(
+        {
+            "status": "SUGGESTIONS_READY_UNCALIBRATED",
+            "presence_hint": "MATCH",
+            "detected_items": [{"sku": "SKU-A", "quantity": None}],
+            "extra_items": [],
+            "image_quality": {"status": "UNKNOWN"},
+            "uncertainties": ["The model did not verify quantity."],
+        },
+        expected_lines="SKU-A:1",
+        observed_contents="",
+    )
+
+    assert workflow["candidate_decision"] == "MANUAL_REVIEW"
+    assert workflow["decision"] == "manual_review"
+    assert workflow["vision_observation"] == ""
+
+
+def test_extra_visual_item_blocks_seal_candidate_and_routes_to_fix():
+    workflow = run_pack_agent_workflow(
+        {
+            "status": "SUGGESTIONS_READY_UNCALIBRATED",
+            "detected_items": [{"sku": "SKU-A", "quantity": 1, "confidence": 0.98, "variant_match": True}],
+            "extra_items": [{"description": "Unordered red bottle", "confidence": 0.97}],
+            "image_quality": {"status": "GOOD"},
+            "occlusion": {"status": "CLEAR"},
+            "uncertainties": [],
+            "confidence": 0.98,
+        },
+        expected_lines="SKU-A:1",
+        observed_contents="",
+    )
+
+    assert workflow["candidate_decision"] == "FIX"
+    assert workflow["decision"] == "fix"
+    assert workflow["action"] == "open_fix_workflow"
+
+
+def test_wrong_variant_blocks_seal_candidate_and_routes_to_fix():
+    workflow = run_pack_agent_workflow(
+        {
+            "status": "SUGGESTIONS_READY_UNCALIBRATED",
+            "detected_items": [{"sku": "SKU-A", "quantity": 1, "confidence": 0.98, "variant_match": False}],
+            "extra_items": [],
+            "image_quality": {"status": "GOOD"},
+            "occlusion": {"status": "CLEAR"},
+            "uncertainties": [],
+            "confidence": 0.98,
+        },
+        expected_lines="SKU-A:1",
+        observed_contents="",
+    )
+
+    assert workflow["candidate_decision"] == "FIX"
+    assert workflow["decision"] == "fix"
+    assert workflow["action"] == "open_fix_workflow"
 
 
 def test_predict_holdout_uses_full_catalog_for_default_gemma(monkeypatch):

@@ -26,10 +26,12 @@ def test_fresh_database_migrations_are_versioned_and_idempotent(tmp_path):
 	with sqlite3.connect(database_path) as connection:
 		versions = connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
 		columns = {row[1] for row in connection.execute("PRAGMA table_info(pack_records)")}
+		product_columns = {row[1] for row in connection.execute("PRAGMA table_info(products)")}
 		login_attempts = connection.execute("PRAGMA table_info(login_attempts)").fetchall()
 
-	assert versions == [(1,), (2,), (3,), (4,), (5,)]
+	assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
 	assert {"video_ref", "session_id", "parent_record_id", "attempt_number"} <= columns
+	assert {"supplier_name", "origin_address", "ordered_for", "delivery_address"} <= product_columns
 	assert login_attempts
 	with sqlite3.connect(database_path) as connection:
 		assert {"organization_id"} <= {row[1] for row in connection.execute("PRAGMA table_info(contract_records)")}
@@ -61,7 +63,7 @@ def test_migration_upgrades_legacy_records_and_preserves_session_identity(tmp_pa
 		user_columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
 
 	assert dict(record) == {"session_id": "PCK-LEGACY", "attempt_number": 1}
-	assert versions == 5
+	assert versions == 7
 	assert {"oidc_issuer", "oidc_subject"} <= user_columns
 
 
@@ -105,7 +107,7 @@ def test_postgresql_migrations_when_test_service_is_configured():
 			adapter.set_rls_organization("org-pg-other")
 			isolated_count = adapter.execute("SELECT COUNT(*) AS count FROM contract_records WHERE record_id = ?", (record_id,)).fetchone()["count"]
 			rlspolicy = adapter.execute("SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'contract_records'").fetchone()
-		assert [row["version"] for row in versions] == [1, 2, 3, 4, 5]
+		assert [row["version"] for row in versions] == [1, 2, 3, 4, 5, 6, 7]
 		assert counts["products"] == 1
 		assert product["sku"] == "SKU-PG-TEST"
 		assert isolated_count == 0

@@ -1,7 +1,85 @@
 {% extends "base.html" %}
-{% block title %}Alerts · PackGuard{% endblock %}
+{% block title %}Pack alerts · PackGuard{% endblock %}
 {% block content %}
-<section class="page-head compact"><div><p class="eyebrow">🚨 Pack attention / {{ active_org }}</p><h1>Alerts</h1><p class="lede">Outbound packages that need a decision before sealing.</p></div></section>
-<section class="alert-summary"><strong>{{ alert_count }}</strong><div><span>active pack alerts</span><small>FAIL, UNCERTAIN, or operator/system disagreement</small></div></section>
-<section class="alert-list">{% for alert in alerts %}<article class="alert-card"><div class="alert-card-head"><div><p class="eyebrow alert-record-id">{{ '🛑' if alert.verdict == 'FAIL' else '🔎' }} {{ alert.record_id }}</p><h2 class="alert-order-id">PO {{ alert.order_id }}</h2><p class="muted">Supplier {{ alert.supplier_name or 'Not recorded' }} · Carton {{ alert.unit_id }} · {{ alert.channel|replace('_', ' ') }}</p></div><span class="status status-{{ alert.verdict|lower }}">{{ alert.verdict }}</span></div><div class="alert-reason"><strong>Why this receiving needs attention</strong><p>{{ alert.reason }}</p></div><div class="route-grid"><div><span>Supplier address</span><strong>{{ alert.origin_address or 'Not recorded' }}</strong></div><div><span>Receiving location</span><strong>{{ alert.delivery_address or 'Not recorded' }}</strong></div></div>{% if alert.photo_ref or alert.video_ref %}<div class="alert-media-preview">{% if alert.photo_ref and alert.photo_ref.startswith(alert.org_id + '/') %}<img src="{{ url_for('media_file', filename=alert.photo_ref) }}" alt="Receiving evidence photo">{% endif %}{% if alert.video_ref and alert.video_ref.startswith(alert.org_id + '/') %}<video controls preload="metadata" src="{{ url_for('media_file', filename=alert.video_ref) }}"></video>{% endif %}</div>{% endif %}<div class="alert-media">{% if alert.photo_ref %}<span>📷 Receiving photo saved</span>{% endif %}{% if alert.video_ref %}<span>🎥 Receiving video saved</span>{% endif %}{% if not alert.photo_ref and not alert.video_ref %}<span>No media attached</span>{% endif %}<a class="button button-secondary" href="{{ url_for('record_detail', record_id=alert.record_id) }}">Open inspection evidence <span>→</span></a></div></article>{% else %}<div class="empty-state"><span>✅</span><h2>No active alerts</h2><p>All current deliveries are accepted or have sufficient evidence.</p></div>{% endfor %}</section>
+<section class="page-head compact">
+  <div>
+    <a class="back-link" href="{{ url_for('dashboard') }}">← Dashboard</a>
+    <p class="eyebrow">🚨 Outbound Pack Verification / {{ active_org }}</p>
+    <h1>Pack Attention &amp; Agent Alerts</h1>
+    <p class="lede">Stage-2 prep results and pack problems with their evidence.</p>
+  </div>
+</section>
+
+<div class="pack-alert-columns">
+  <section class="pack-alert-column" aria-labelledby="stage-two-heading">
+    <header class="pack-alert-heading">
+      <div><p class="eyebrow">Stage 2 input</p><h2 id="stage-two-heading">Stage-2 Prep Agent &#8594; Stage-3 Pack Check</h2></div>
+      <span class="pack-alert-count">{{ incoming_agent_alerts|length }}</span>
+    </header>
+    {% for item in incoming_agent_alerts %}
+      <article class="pack-alert-item">
+        <div class="pack-alert-item-heading">
+          <div><strong>{{ item.product_name }}</strong><span>{{ item.product_sku or 'SKU not supplied' }} · {{ item.quantity if item.quantity is not none else 'quantity unknown' }} unit(s)</span></div>
+          <span class="pack-alert-status">{{ item.status|replace('_', ' ') }}</span>
+        </div>
+        <dl class="pack-alert-facts">
+          <div><dt>Prep record</dt><dd>{{ item.record_id }}</dd></div>
+          <div><dt>Order</dt><dd>{{ item.subject.order_id or 'Not supplied' }}</dd></div>
+          <div><dt>Shipment</dt><dd>{{ item.subject.shipment_id or 'Not supplied' }}</dd></div>
+          <div><dt>Prep decision</dt><dd>{{ item.outcome.decision|replace('_', ' ') }} · {{ item.status|replace('_', ' ') }}</dd></div>
+          <div><dt>Expected</dt><dd><code>{{ item.expected_lines }}</code></dd></div>
+        </dl>
+        {% if item.checks %}<div class="pack-alert-prep-checks">{% for check in item.checks %}<p><strong>{{ check.check_key|replace('_', ' ')|title }} · {{ check.verdict|upper }}</strong>{% if check.detail.get('reason') %}<span>{{ check.detail.reason }}</span>{% endif %}</p>{% endfor %}</div>{% endif %}
+        {% if item.image_urls %}<div class="pack-alert-prep-images">{% for image_url in item.image_urls %}<a href="{{ image_url }}" target="_blank" rel="noopener"><img src="{{ image_url }}" alt="Stage 2 prep evidence" loading="lazy"></a>{% endfor %}</div>{% endif %}
+        {% if item.capture_url %}<a class="button button-secondary" href="{{ item.capture_url }}">Start pack capture</a>{% else %}<p class="pack-alert-empty">This prep record is incomplete or does not include an order, SKU, and expected quantity needed to start a pack check.</p>{% endif %}
+      </article>
+    {% else %}
+      <div class="pack-alert-empty">No persisted stage-2 prep handoffs are available for this workspace.</div>
+    {% endfor %}
+  </section>
+
+  <section class="pack-alert-column pack-alert-column-issues" aria-labelledby="stage-three-heading">
+    <header class="pack-alert-heading">
+      <div><p class="eyebrow">Stage 3 output</p><h2 id="stage-three-heading">Pack checks needing review</h2></div>
+      <span class="pack-alert-count">{{ wrong_package_alerts|length }}</span>
+    </header>
+    {% for alert in wrong_package_alerts %}
+      {% set inspection = alert.inspection or {} %}
+      <article class="pack-alert-item pack-alert-issue">
+        <div class="pack-alert-item-heading">
+          <div><strong>Order {{ alert.order_id }}</strong><span>{{ alert.record_id }} · Unit {{ alert.unit_id }}</span></div>
+          <span class="pack-alert-status {{ 'is-fail' if alert.verdict == 'FAIL' else 'is-review' }}">{{ 'STOP & FIX' if alert.verdict == 'FAIL' else 'REVIEW' }}</span>
+        </div>
+        <p class="pack-alert-reason">{{ alert.diagnosis.issue_summary or alert.reason }}</p>
+        <dl class="pack-alert-facts">
+          <div><dt>Expected</dt><dd><code>{{ alert.order_lines or 'Not recorded' }}</code></dd></div>
+          <div><dt>Observed</dt><dd><code>{{ alert.observed_in_box or 'Not recorded' }}</code></dd></div>
+          {% if alert.supplier_name %}<div><dt>Supplier</dt><dd>{{ alert.supplier_name }}</dd></div>{% endif %}
+          {% if alert.origin_address %}<div><dt>Origin</dt><dd>{{ alert.origin_address }}</dd></div>{% endif %}
+          {% if inspection.get('candidate_decision') %}<div><dt>Agent recommendation</dt><dd>{{ inspection.candidate_decision|replace('_', ' ') }} · {{ inspection.candidate_reason }}</dd></div>{% endif %}
+          {% if inspection.get('image_quality') %}<div><dt>Image quality</dt><dd>{{ inspection.image_quality.get('status', 'UNKNOWN')|replace('_', ' ') }}{% if inspection.image_quality.get('reason') %} · {{ inspection.image_quality.reason }}{% endif %}</dd></div>{% endif %}
+          {% if inspection.get('uncertainties') %}<div><dt>Vision notes</dt><dd>{{ inspection.uncertainties|join('; ') }}</dd></div>{% endif %}
+        </dl>
+        {% if alert.photo_url %}<a class="pack-alert-photo-link" href="{{ alert.photo_url }}" target="_blank" rel="noopener"><img src="{{ alert.photo_url }}" alt="Pack evidence for order {{ alert.order_id }}" loading="lazy"></a>{% endif %}
+        <a class="button button-secondary" href="{{ alert.evidence_url or url_for('record_detail', record_id=alert.record_id) }}">Open evidence record</a>
+      </article>
+    {% else %}
+      <div class="pack-alert-empty">No failed or uncertain pack records currently need attention.</div>
+    {% endfor %}
+  </section>
+</div>
+
+<style>
+.pack-alert-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;align-items:start}
+.pack-alert-column{min-width:0;padding:20px;border:1px solid rgba(41,49,58,.14);border-radius:8px;background:rgba(255,255,255,.82)}
+.pack-alert-heading,.pack-alert-item-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.pack-alert-heading{margin-bottom:16px}.pack-alert-heading .eyebrow{margin-bottom:5px}.pack-alert-heading h2{margin:0;font-size:21px}
+.pack-alert-count{display:grid;place-items:center;min-width:30px;height:30px;border-radius:50%;background:#e9f1eb;font-weight:800}
+.pack-alert-item{padding:15px 0;border-top:1px solid rgba(41,49,58,.12)}.pack-alert-item-heading strong,.pack-alert-item-heading span{display:block}.pack-alert-item-heading strong{overflow-wrap:anywhere}.pack-alert-item-heading div>span{margin-top:4px;color:#58645d;font-size:13px;overflow-wrap:anywhere}
+.pack-alert-status{flex:none;padding:5px 8px;border-radius:5px;background:#edf0ef;color:#37413c;font-size:11px;font-weight:800}.pack-alert-status.is-fail{background:#fae4df;color:#8d3428}.pack-alert-status.is-review{background:#fff0c9;color:#6d571a}
+.pack-alert-facts{display:grid;gap:9px;margin:14px 0}.pack-alert-facts div{display:grid;grid-template-columns:minmax(80px,.35fr) minmax(0,1fr);gap:10px}.pack-alert-facts dt{color:#68736d;font-size:12px}.pack-alert-facts dd{min-width:0;margin:0;overflow-wrap:anywhere}.pack-alert-facts code{white-space:pre-wrap;overflow-wrap:anywhere}
+.pack-alert-reason{margin:14px 0 0;font-weight:700}.pack-alert-photo-link{display:block;margin:12px 0}.pack-alert-photo-link img{display:block;width:100%;max-height:280px;object-fit:contain;background:#f1f3f2;border-radius:6px}.pack-alert-empty{padding:18px;border:1px dashed rgba(41,49,58,.2);border-radius:6px;color:#58645d;line-height:1.5}
+.pack-alert-prep-checks{display:grid;gap:7px;margin:12px 0}.pack-alert-prep-checks p{display:grid;gap:3px;margin:0;padding:9px 10px;border-left:3px solid #7aa58e;background:#f1f7f3}.pack-alert-prep-checks span{font-size:12px;overflow-wrap:anywhere}.pack-alert-prep-images{display:flex;gap:8px;overflow-x:auto;margin:12px 0}.pack-alert-prep-images img{width:88px;height:72px;object-fit:cover;border-radius:5px;background:#f1f3f2}
+@media(max-width:760px){.pack-alert-columns{grid-template-columns:1fr}.pack-alert-column{padding:16px}.pack-alert-facts div{grid-template-columns:1fr;gap:3px}}
+</style>
 {% endblock %}

@@ -18,6 +18,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
+from urllib.parse import urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -28,7 +29,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from database import APP_DIR, DB_PATH, append_contract_override, clear_login_attempts, complete_contract_capture, connect, create_contract_capture, get_contract_capture, get_contract_record, get_oidc_user, get_product, get_record, get_user, init_db, link_oidc_identity, list_audit_events, list_contract_records, list_products, list_records, list_session_records, list_support_requests, login_blocked_until, record_login_failure, reset_organization_context, save_audit_event, save_product, save_record, save_support_request, save_user, set_organization_context, update_contract_record, update_workflow_state, user_exists
+from database import APP_DIR, DB_PATH, append_contract_override, clear_login_attempts, complete_contract_capture, connect, create_contract_capture, get_contract_capture, get_contract_record, get_oidc_user, get_product, get_record, get_user, init_db, link_oidc_identity, list_audit_events, list_contract_records, list_products, list_records, list_session_records, list_support_requests, login_blocked_until, record_login_failure, reset_organization_context, save_audit_event, save_contract_record, save_product, save_record, save_support_request, save_user, set_organization_context, update_contract_record, update_workflow_state, user_exists
 from detector import observe, observe_image
 from evedince import build_evidence
 from evaluation import summarize_records
@@ -37,7 +38,7 @@ from agent import assess_pack, enforce_component_verdict
 from orchestrator import FAILED_VISION_STATUSES, run_pack_agent_workflow
 from production import readiness_report
 from storage import create_media_storage
-from verifier import parse_lines, verify_pack
+from verifier import diagnose_pack_contents, parse_lines, verify_pack
 from vision import inspect_image
 from contract import SUBJECT_FIELDS, build_record as build_contract_record, content_hash, organization_uuid, utc_now, validate_record
 
@@ -57,7 +58,7 @@ app.config.update(
 	SESSION_COOKIE_SECURE=IS_PRODUCTION,
 	WTF_CSRF_ENABLED=IS_PRODUCTION,
 )
-CSRFProtect(app)
+csrf = CSRFProtect(app)
 oauth = OAuth(app)
 try:
 	TRUSTED_PROXY_COUNT = int(os.environ.get("PACKGUARD_TRUSTED_PROXY_COUNT", "0"))
@@ -82,6 +83,23 @@ OIDC_ENABLED = bool(
 	OIDC_ISSUER_URL and OIDC_CLIENT_ID and OIDC_CLIENT_SECRET
 	and (not IS_PRODUCTION or (OIDC_ISSUER_URL.startswith("https://") and OIDC_REDIRECT_URI.startswith("https://")))
 )
+PREP_AGENT_API_TOKEN = os.environ.get("PACKGUARD_PREP_AGENT_TOKEN", "").strip()
+PACK_FEED_AGENT_API_TOKEN = os.environ.get("PACKGUARD_PACK_FEED_TOKEN", "").strip()
+AGENT_API_ORG_ID = os.environ.get("PACKGUARD_AGENT_API_ORG_ID", "").strip()
+RETURNS_AGENT_WEBHOOK_URL = os.environ.get("PACKGUARD_RETURNS_AGENT_URL", "").strip()
+RETURNS_AGENT_WEBHOOK_TOKEN = os.environ.get("PACKGUARD_RETURNS_AGENT_TOKEN", "").strip()
+if (PREP_AGENT_API_TOKEN or PACK_FEED_AGENT_API_TOKEN or RETURNS_AGENT_WEBHOOK_URL or RETURNS_AGENT_WEBHOOK_TOKEN) and not AGENT_API_ORG_ID:
+	raise RuntimeError("PACKGUARD_AGENT_API_ORG_ID is required when machine agent tokens are configured")
+if any(token and len(token) < 32 for token in (PREP_AGENT_API_TOKEN, PACK_FEED_AGENT_API_TOKEN, RETURNS_AGENT_WEBHOOK_TOKEN)):
+	raise RuntimeError("Machine agent tokens must contain at least 32 characters")
+if bool(RETURNS_AGENT_WEBHOOK_URL) != bool(RETURNS_AGENT_WEBHOOK_TOKEN):
+	raise RuntimeError("PACKGUARD_RETURNS_AGENT_URL and PACKGUARD_RETURNS_AGENT_TOKEN must be configured together")
+if RETURNS_AGENT_WEBHOOK_URL:
+	webhook_parts = urlsplit(RETURNS_AGENT_WEBHOOK_URL)
+	if webhook_parts.scheme not in {"http", "https"} or not webhook_parts.netloc:
+		raise RuntimeError("PACKGUARD_RETURNS_AGENT_URL must be an absolute HTTP(S) URL")
+	if IS_PRODUCTION and webhook_parts.scheme != "https":
+		raise RuntimeError("PACKGUARD_RETURNS_AGENT_URL must use HTTPS in production")
 SAMPLE_PRODUCT_NAMES = {
 	"SKU-CABLE-USBC": "USB-C cable",
 	"SKU-BOTTLE-750": "750 mL bottle",
@@ -93,6 +111,9 @@ SAMPLE_PRODUCT_NAMES = {
 	"SKU-PROT-1KG": "Unspecified 1 kg product",
 	"SKU-MUG-11": "Mug (variant unspecified)",
 	"SKU-LEASH-6FT": "6 ft leash",
+	"SKU-TSHIRT-BLK": "Black T-Shirt",
+	"SKU-CAP-BLU": "Blue Cap",
+	"SKU-CAP-RED": "Red Cap",
 }
 ALLOWED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 ALLOWED_VIDEO_EXTENSIONS = {"mp4", "webm", "mov"}
@@ -129,6 +150,207 @@ def current_org() -> str:
 	return session.get("org_id", DEFAULT_ORG)
 
 
+def agent_api_org(expected_token: str):
+	if not expected_token or not AGENT_API_ORG_ID:
+		return None, (jsonify({"error": "Machine-to-machine agent access is not configured."}), 503)
+	authorization = request.headers.get("Authorization", "")
+	scheme, separator, supplied_token = authorization.partition(" ")
+	if (
+		not separator or scheme.casefold() != "bearer"
+		or not hmac.compare_digest(supplied_token, expected_token)
+	):
+		return None, (jsonify({"error": "Invalid agent credentials."}), 401)
+	return AGENT_API_ORG_ID, None
+
+
+def prep_record_is_ready(record: dict[str, Any]) -> bool:
+	checks = record.get("checks", [])
+	if record.get("status") != "complete" or not checks:
+		return False
+	latest_overrides = {
+		item["check_key"]: item["to_verdict"]
+		for item in record.get("overrides", [])
+	}
+	return all(
+		latest_overrides.get(check["check_key"], check["verdict"]) == "pass"
+		for check in checks
+	)
+
+
+def prep_record_logistics(record: dict[str, Any]) -> dict[str, str | None]:
+	"""Read route metadata supplied by the upstream prep agent's check details."""
+	fields = {
+		"supplier_name": ("supplier_name", "supplier"),
+		"origin_address": ("origin_address", "source_address", "ship_from"),
+		"ordered_for": ("ordered_for", "recipient", "customer_name"),
+		"delivery_address": ("delivery_address", "destination_address", "ship_to"),
+	}
+	result: dict[str, str | None] = {field: None for field in fields}
+	for check in record.get("checks", []):
+		detail = check.get("detail") or {}
+		for source in (detail.get("logistics") or {}, detail):
+			if not isinstance(source, dict):
+				continue
+			for field, aliases in fields.items():
+				if result[field]:
+					continue
+				value = next((source.get(alias) for alias in aliases if source.get(alias)), None)
+				if isinstance(value, str) and value.strip():
+					result[field] = value.strip()
+	return result
+
+
+def build_stage3_contract_record(
+	*,
+	organization_key: str,
+	prep_record: dict[str, Any],
+	operator_label: str,
+	expected_lines: str,
+	observed_contents: str,
+	pack_result: dict[str, Any],
+	vision_result: dict[str, Any],
+	product_routes: list[dict[str, Any]],
+	photo_ref: str | None,
+) -> dict[str, Any]:
+	"""Build the downstream CUBE record for a prep-sourced legacy New Check."""
+	prep_subject = prep_record["subject"]
+	workflow = run_pack_agent_workflow(
+		vision_result,
+		expected_lines=expected_lines,
+		observed_contents=observed_contents,
+	)
+	images = []
+	if photo_ref:
+		try:
+			if photo_ref.startswith("fixtures/vision/"):
+				image_bytes = (APP_DIR / photo_ref).read_bytes()
+			else:
+				image_bytes = MEDIA_STORAGE.read(photo_ref)
+		except (OSError, ValueError):
+			image_bytes = None
+		if image_bytes:
+			images.append({
+				"key": photo_ref,
+				"sha256": hashlib.sha256(image_bytes).hexdigest(),
+				"bytes": len(image_bytes),
+				"taken_at": utc_now(),
+			})
+	manual_observed = parse_lines(observed_contents)
+	vision_observed = parse_lines(workflow["vision_observation"])
+	observed_quantities = manual_observed or vision_observed
+	observed_quantity = observed_quantities.get(str(prep_subject["sku"]))
+	if not isinstance(observed_quantity, int) or isinstance(observed_quantity, bool):
+		observed_quantity = None
+	verdict = {"PASS": "pass", "FAIL": "fail", "UNCERTAIN": "uncertain"}.get(
+		pack_result.get("verdict"), "uncertain",
+	)
+	vision_status = vision_result.get("status", "MODEL_ERROR")
+	visual_verdict = "uncertain"
+	visual_detail = {
+		"status": vision_status,
+		"presence_hint": vision_result.get("presence_hint"),
+		"detected_items": vision_result.get("detected_items", []),
+		"extra_items": vision_result.get("extra_items", []),
+		"image_quality": vision_result.get("image_quality", {}),
+		"occlusion": vision_result.get("occlusion", {}),
+		"uncertainties": vision_result.get("uncertainties", []),
+		"confidence": vision_result.get("confidence"),
+		"vision_observation_candidate": workflow["vision_observation"] or None,
+		"candidate_decision": workflow["candidate_decision"],
+		"candidate_reason": workflow["candidate_reason"],
+		"automatic_seal_authorized": False,
+		"source_prep_record_id": prep_record["record_id"],
+		"agent_run": workflow["trace"],
+	}
+	checks = [{
+		"check_key": "sku_quantity",
+		"verdict": verdict,
+		"confidence": None,
+		"detail": {
+			"sku_checks": pack_result.get("checks", []),
+			"expected_lines": expected_lines,
+			"observed_contents": observed_contents or None,
+			"source_prep_record_id": prep_record["record_id"],
+			"product_routes": product_routes,
+		},
+		"model_version": "deterministic-packguard-v1",
+		"latency_ms": 0,
+	}, {
+		"check_key": "visual_evidence",
+		"verdict": visual_verdict,
+		"confidence": vision_result.get("confidence"),
+		"detail": visual_detail,
+		"model_version": vision_result.get("provider", "unavailable"),
+		"latency_ms": int(vision_result.get("inference_ms") or 0),
+	}]
+	return build_contract_record(
+		organization_key=organization_key,
+		client_id=None,
+		agent="pack",
+		subject={
+			"type": "order",
+			"asin": prep_subject.get("asin"),
+			"sku": prep_subject.get("sku"),
+			"order_id": prep_subject.get("order_id"),
+			"po_line_id": prep_subject.get("po_line_id"),
+			"shipment_id": prep_subject.get("shipment_id"),
+			"quantity_expected": prep_subject.get("quantity_expected"),
+			"quantity_observed": observed_quantity,
+		},
+		operator_label=operator_label,
+		images=images,
+		checks=checks,
+		decision=workflow["decision"],
+		decided_by="agent",
+		status="pending" if vision_status in FAILED_VISION_STATUSES else "complete",
+	)
+
+
+def publish_pack_record(record: dict[str, Any]) -> bool | None:
+	if not RETURNS_AGENT_WEBHOOK_URL or not RETURNS_AGENT_WEBHOOK_TOKEN:
+		return None
+	if record.get("organization_id") != organization_uuid(AGENT_API_ORG_ID):
+		return None
+	payload = json.dumps(record, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+	webhook_request = Request(
+		RETURNS_AGENT_WEBHOOK_URL,
+		data=payload,
+		headers={
+			"Authorization": f"Bearer {RETURNS_AGENT_WEBHOOK_TOKEN}",
+			"Content-Type": "application/json",
+			"Idempotency-Key": record["record_id"],
+		},
+		method="POST",
+	)
+	status_code = None
+	try:
+		with urlopen(webhook_request, timeout=10) as response:
+			status_code = getattr(response, "status", 200)
+			if not 200 <= status_code < 300:
+				raise OSError(f"HTTP {status_code}")
+	except (HTTPError, URLError, TimeoutError, OSError) as error:
+		app.logger.warning(
+			"Pack webhook delivery failed for %s (%s); the authenticated pack feed remains available",
+			record["record_id"], type(error).__name__,
+		)
+		delivery_status = "FAILED"
+		reason = "Stage-4 webhook delivery failed; retry or use the authenticated pack feed."
+	else:
+		delivery_status = "DELIVERED"
+		reason = "Stage-4 agent acknowledged the Pack record."
+	save_audit_event({
+		"event_id": f"AGT-{uuid4().hex[:12].upper()}",
+		"record_id": record["record_id"],
+		"org_id": AGENT_API_ORG_ID,
+		"event_type": f"RETURNS_AGENT_{delivery_status}",
+		"reason": reason,
+		"actor_id": "agent:packguard_stage3",
+		"created_at": utc_now(),
+		"details": {"http_status": status_code, "agent": "returns", "record_id": record["record_id"]},
+	})
+	return delivery_status == "DELIVERED"
+
+
 @app.before_request
 def bind_database_organization():
 	if session.get("org_id"):
@@ -146,7 +368,11 @@ def bind_database_organization():
 def reset_database_organization(_error=None):
 	token = getattr(g, "organization_context_token", None)
 	if token is not None:
-		reset_organization_context(token)
+		g.organization_context_token = None
+		try:
+			reset_organization_context(token)
+		except RuntimeError:
+			pass
 
 
 def seed_demo_users() -> None:
@@ -450,6 +676,10 @@ def product_catalog():
 			"brand": request.form.get("brand", "").strip() or None,
 			"external_id": request.form.get("external_id", "").strip() or None,
 			"barcode": request.form.get("barcode", "").strip() or None,
+			"supplier_name": request.form.get("supplier_name", "").strip() or None,
+			"origin_address": request.form.get("origin_address", "").strip() or None,
+			"ordered_for": request.form.get("ordered_for", "").strip() or None,
+			"delivery_address": request.form.get("delivery_address", "").strip() or None,
 			"attributes": attributes,
 			"reference_image_ref": reference_image_ref,
 			"created_at": datetime.now(timezone.utc).isoformat(),
@@ -469,6 +699,7 @@ def vision_catalog_products(org_id: str, expected_skus: set[str]) -> list[dict[s
 	# Keep the full tenant catalog so vision can identify wrong or extra products,
 	# not only confirm SKUs already present in the expected order.
 	products = catalog_products(org_id)
+	products.sort(key=lambda product: product.get("sku") not in expected_skus)
 	for product in products:
 		reference = product.get("reference_image_ref")
 		if not reference:
@@ -592,17 +823,183 @@ def answer_from_order_record(record: dict[str, object], question: str) -> str:
 	)
 
 
-def assistant_answer(question: str, org_id: str, history: list[dict[str, str]] | None = None) -> str:
+def answer_from_contract_record(record: dict[str, Any], question: str) -> str:
+	subject = record.get("subject") or {}
+	checks = record.get("checks", [])
+	sku_check = next((check for check in checks if check["check_key"] == "sku_quantity"), {})
+	visual_check = next((check for check in checks if check["check_key"] == "visual_evidence"), {})
+	product_routes = sku_check.get("detail", {}).get("product_routes", [])
+	if record.get("agent") == "prep":
+		prep_route = prep_record_logistics(record)
+		product_routes = [{**prep_route, "product_name": subject.get("sku"), "sku": subject.get("sku")}]
+	question_lower = question.casefold()
+	if any(word in question_lower for word in ("address", "from", "source", "destination", "where", "ordered for", "recipient")):
+		if product_routes:
+			route = product_routes[0]
+			return (
+				f"{route.get('product_name') or subject.get('sku')}: supplier {route.get('supplier_name') or 'not recorded'}, "
+				f"from {route.get('origin_address') or 'not recorded'}, ordered for {route.get('ordered_for') or 'not recorded'}, "
+				f"destination {route.get('delivery_address') or 'not recorded'}."
+			)
+		return "This evidence record does not contain source, recipient, or destination details."
+	return (
+		f"Stage-{record.get('agent')} record {record['record_id']} for order {subject.get('order_id') or 'not recorded'}: "
+		f"SKU {subject.get('sku') or 'not recorded'}, expected quantity {subject.get('quantity_expected') if subject.get('quantity_expected') is not None else 'not recorded'}, "
+		f"decision {record.get('outcome', {}).get('decision', 'not recorded')}, status {record.get('status', 'not recorded')}. "
+		f"Visual result: {visual_check.get('detail', {}).get('candidate_decision') or visual_check.get('detail', {}).get('presence_hint') or visual_check.get('detail', {}).get('status', 'not recorded')}."
+	)
+
+
+def agent_workflow_summary(org_id: str) -> str:
+	prep_records = list_contract_records(org_id, since=None, agent="prep", cursor=None, limit=100)
+	pack_records = list_contract_records(org_id, since=None, agent="pack", cursor=None, limit=100)
+	delivered_count = 0
+	failed_count = 0
+	for record in pack_records:
+		for event in list_audit_events(record["record_id"], org_id):
+			if event["event_type"] == "RETURNS_AGENT_DELIVERED":
+				delivered_count += 1
+				break
+			if event["event_type"] == "RETURNS_AGENT_FAILED":
+				failed_count += 1
+				break
+	returns_state = "configured" if (
+		RETURNS_AGENT_WEBHOOK_URL and RETURNS_AGENT_WEBHOOK_TOKEN and AGENT_API_ORG_ID == org_id
+	) else "not configured"
+	return (
+		f"Live workflow for {org_id}: {len(prep_records)} Stage-2 prep record(s), "
+		f"{len(pack_records)} Stage-3 pack record(s), {delivered_count} delivered to Stage 4, "
+		f"and {failed_count} delivery failure(s). Stage-4 webhook is {returns_state}. "
+		"Open New Check to continue a ready prep record; review delivery issues in Alerts."
+	)
+
+
+def assistant_answer(
+	question: str,
+	org_id: str,
+	history: list[dict[str, str]] | None = None,
+	page_context: dict[str, Any] | None = None,
+) -> str:
 	"""Answer operational questions from the current organization's records."""
 	question_lower = question.lower()
 	records = list_records(org_id)
 	alerts = alert_records(org_id)
+	products = catalog_products(org_id)
+	page_context = page_context if isinstance(page_context, dict) else {}
+	current_page = page_context.get("current_page") if isinstance(page_context.get("current_page"), dict) else {}
+	page_path = str(current_page.get("path") or "")[:240]
+	raw_form_fields = page_context.get("form_fields") if isinstance(page_context.get("form_fields"), dict) else {}
+	allowed_form_fields = {
+		"product_lookup", "selected_product_id", "source_prep_record_id", "order_id",
+		"unit_id", "order_lines", "observed_in_box", "channel",
+	}
+	form_fields = {
+		key: value.strip()[:500]
+		for key, value in raw_form_fields.items()
+		if key in allowed_form_fields and isinstance(value, str) and value.strip()
+	}
+	current_record = None
+	path_record = re.search(r"/(?:v1/)?records/([^/?#]+)", page_path)
+	if path_record:
+		current_record = get_record(path_record.group(1), org_id) or get_contract_record(path_record.group(1), org_id)
+	if not current_record:
+		context_record_id = str(page_context.get("record_id") or "")
+		if context_record_id:
+			current_record = get_record(context_record_id, org_id) or get_contract_record(context_record_id, org_id)
+	if not current_record:
+		prep_record_id = str(page_context.get("source_prep_record_id") or form_fields.get("source_prep_record_id") or "")
+		if prep_record_id:
+			prep_record = get_contract_record(prep_record_id, org_id)
+			if prep_record and prep_record.get("agent") == "prep":
+				current_record = prep_record
+	current_product = None
+	product_id = str(page_context.get("product_id") or form_fields.get("selected_product_id") or "")
+	if product_id:
+		current_product = next((product for product in products if product.get("product_id") == product_id), None)
+	if not current_product and form_fields.get("product_lookup"):
+		lookup = form_fields["product_lookup"].casefold()
+		current_product = next((
+			product for product in products
+			if lookup in {
+				str(product.get("product_name") or "").casefold(),
+				str(product.get("product_id") or "").casefold(),
+				str(product.get("sku") or "").casefold(),
+				str(product.get("barcode") or "").casefold(),
+			}
+		), None)
+	if not current_product:
+		product_path = re.search(r"/catalog/product/([^/?#]+)", page_path)
+		if product_path:
+			current_product = next((product for product in products if product.get("sku") == product_path.group(1)), None)
+	safe_page_context = {
+		"current_page": {"title": str(current_page.get("title") or "")[:120], "path": page_path},
+		"recent_pages": [
+			{"title": str(item.get("title") or "")[:120], "path": str(item.get("path") or "")[:240]}
+			for item in page_context.get("recent_pages", [])[:8]
+			if isinstance(item, dict)
+		],
+		"current_form": form_fields,
+	}
+	if current_record:
+		if "evidence_json" in current_record:
+			current_record["evidence"] = json.loads(current_record.pop("evidence_json"))
+			safe_page_context["current_record"] = {
+				"record_id": current_record["record_id"], "order_id": current_record["order_id"],
+				"unit_id": current_record["unit_id"], "verdict": current_record["verdict"],
+				"action": current_record["action"], "order_lines": current_record["order_lines"],
+				"observed_in_box": current_record.get("observed_in_box"),
+				"origin_address": current_record.get("origin_address"),
+				"delivery_address": current_record.get("delivery_address"),
+			}
+		else:
+			safe_page_context["current_contract_record"] = current_record
+	if current_product:
+		safe_page_context["current_product"] = {
+			key: current_product.get(key) for key in (
+				"product_id", "product_name", "sku", "brand", "barcode", "attributes",
+				"supplier_name", "origin_address", "ordered_for", "delivery_address",
+			)
+		}
 	mentioned_record = next((
 		record for record in records
 		if record["order_id"].lower() in question_lower or record["unit_id"].lower() in question_lower or record["record_id"].lower() in question_lower
 	), None)
 	if mentioned_record:
 		return answer_from_order_record(mentioned_record, question)
+	mentioned_product = next((
+		product for product in products
+		if any(
+			str(product.get(field) or "").strip().casefold() in question_lower
+			for field in ("sku", "product_id", "barcode", "product_name")
+			if str(product.get(field) or "").strip()
+		)
+	), None)
+	if mentioned_product:
+		attributes = mentioned_product.get("attributes") or {}
+		return (
+			f"Catalog product: {mentioned_product['product_name']} (SKU {mentioned_product['sku']}; "
+			f"Product ID {mentioned_product['product_id']}). Brand: {mentioned_product.get('brand') or 'not recorded'}. "
+			f"Barcode: {mentioned_product.get('barcode') or 'not recorded'}. "
+			f"Attributes: {json.dumps(attributes, ensure_ascii=True) if attributes else 'not recorded'}. "
+			f"Supplier: {mentioned_product.get('supplier_name') or 'not recorded'}. "
+			f"Source / arrival address: {mentioned_product.get('origin_address') or 'not recorded'}. "
+			f"Ordered for: {mentioned_product.get('ordered_for') or 'not recorded'}. "
+			f"Destination address: {mentioned_product.get('delivery_address') or 'not recorded'}. "
+			"This describes the catalog entry, not a visual confirmation of a specific item."
+		)
+	if not mentioned_record and current_record and any(term in question_lower for term in ("this", "current", "here", "page", "record", "it", "what do i do")):
+		if "evidence_json" in current_record:
+			return answer_from_order_record(current_record, question)
+		return answer_from_contract_record(current_record, question)
+	if not mentioned_product and current_product and any(term in question_lower for term in ("this", "current", "here", "page", "product", "it")):
+		mentioned_product = current_product
+		attributes = mentioned_product.get("attributes") or {}
+		return (
+			f"Catalog product: {mentioned_product['product_name']} (SKU {mentioned_product['sku']}; Product ID {mentioned_product['product_id']}). "
+			f"Supplier: {mentioned_product.get('supplier_name') or 'not recorded'}. From: {mentioned_product.get('origin_address') or 'not recorded'}. "
+			f"Ordered for: {mentioned_product.get('ordered_for') or 'not recorded'}. Destination: {mentioned_product.get('delivery_address') or 'not recorded'}. "
+			f"Brand: {mentioned_product.get('brand') or 'not recorded'}. Attributes: {json.dumps(attributes, ensure_ascii=True) if attributes else 'not recorded'}."
+		)
 	history_text = " ".join(
 		message.get("content", "").lower()
 		for message in (history or [])
@@ -632,6 +1029,8 @@ def assistant_answer(question: str, org_id: str, history: list[dict[str, str]] |
 	for record in records:
 		if record["order_id"].lower() in question_lower or record["unit_id"].lower() in question_lower:
 			return answer_from_order_record(record, question)
+	if any(term in question_lower for term in ("agent", "point a", "point b", "transfer", "origin agent", "a2a", "multi-agent")):
+		return agent_workflow_summary(org_id)
 	if re.search(r"\b(hello|hi|hey)\b", question_lower):
 		return "Hello. I can explain PackGuard decisions, orders, alerts, addresses, evidence, media, reports, security, and the demo workflow."
 	if any(term in question_lower for term in ("what can you do", "help", "options", "capabilities")):
@@ -692,10 +1091,15 @@ def assistant_answer(question: str, org_id: str, history: list[dict[str, str]] |
 		return "The next major milestone is configuring a calibrated vision provider and evaluating it on the held-out fixture set with false positives, false negatives, and UNCERTAIN rates."
 	if any(term in question_lower for term in ("order address", "address for an order", "order's address", "arrived from", "ship to")) and "order" in question_lower:
 		return "Ask about a specific Order ID or Unit ID to retrieve its arrival and delivery addresses."
-	return general_assistant_answer(question, history)
+	return general_assistant_answer(question, history, products, safe_page_context)
 
 
-def general_assistant_answer(question: str, history: list[dict[str, str]] | None = None) -> str:
+def general_assistant_answer(
+	question: str,
+	history: list[dict[str, str]] | None = None,
+	products: list[dict[str, object]] | None = None,
+	page_context: dict[str, Any] | None = None,
+) -> str:
 	"""Answer general questions with a local model by default, without a paid API key."""
 	conversation = [
 		{"role": message["role"], "content": message["content"][:2000]}
@@ -713,7 +1117,11 @@ def general_assistant_answer(question: str, history: list[dict[str, str]] | None
 		"If live facts are needed, explain that briefly and still provide useful general guidance. "
 		"PackGuard pages are Dashboard, Alerts, Catalog, Vision set, Assistant, Support, Capture, Record, and Evaluation. "
 		"PackGuard decisions are PASS/SEAL, FAIL/FIX, RECAPTURE, and MANUAL_REVIEW. "
-		"Vision output is advisory and cannot authorize SEAL until calibration is approved."
+		"Vision output is advisory and cannot authorize SEAL until calibration is approved. "
+		"Use the active organization's catalog context below for product facts. Do not infer "
+		"origin, condition, or package contents unless the supplied records explicitly contain them. "
+		f"Catalog context: {json.dumps((products or [])[:40], ensure_ascii=True, default=str)[:10000]} "
+		f"Current page and recent navigation context: {json.dumps(page_context or {}, ensure_ascii=True, default=str)[:6000]}"
 	)
 	model = os.environ.get("OLLAMA_MODEL", "qwen3:1.7b")
 	base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
@@ -747,8 +1155,131 @@ def general_assistant_answer(question: str, history: list[dict[str, str]] | None
 @app.get("/alerts")
 @login_required
 def alerts():
-	alerts = alert_records(current_org())
-	return render_template("alerts.html", alerts=alerts, alert_count=len(alerts))
+	org_id = current_org()
+	alerts = alert_records(org_id)
+	catalog = {p["sku"]: p["product_name"] for p in catalog_products(org_id)}
+	prep_records = list_contract_records(org_id, since=None, agent="prep", cursor=None, limit=20)
+	incoming_agent_alerts = []
+	for prep_record in prep_records:
+		subject = prep_record.get("subject") or {}
+		sku = str(subject.get("sku") or "").strip()
+		quantity = subject.get("quantity_expected")
+		order_id = str(subject.get("order_id") or "").strip()
+		logistics = prep_record_logistics(prep_record)
+		prep_checks = prep_record.get("checks", [])
+		prep_ready = prep_record_is_ready(prep_record)
+		item = dict(prep_record)
+		item.update({
+			"product_sku": sku,
+			"product_name": catalog.get(sku, sku or "Product not identified in catalog"),
+			"quantity": quantity,
+			"expected_lines": f"{sku}:{quantity}" if sku and isinstance(quantity, int) else "Not supplied by prep agent",
+			"source_point": logistics.get("origin_address") or f"Stage 2 prep · {prep_record.get('operator_label') or 'agent'}",
+			"destination_point": logistics.get("delivery_address") or "Stage 3 · PackGuard",
+			"note": f"Supplier: {logistics.get('supplier_name') or 'not recorded'} · Ordered for: {logistics.get('ordered_for') or 'not recorded'}",
+			"capture_url": None,
+		})
+		if prep_ready and order_id and sku and isinstance(quantity, int) and quantity > 0:
+			item["capture_url"] = url_for("capture", prep_record_id=prep_record["record_id"])
+		incoming_agent_alerts.append(item)
+
+	wrong_package_alerts = []
+	for legacy_alert in alerts:
+		diagnosis = diagnose_pack_contents(
+			legacy_alert.get("order_lines", ""),
+			legacy_alert.get("observed_in_box", ""),
+			catalog_names=catalog,
+		)
+		legacy_copy = dict(legacy_alert)
+		legacy_evidence = json.loads(legacy_copy.get("evidence_json") or "{}")
+		legacy_copy["inspection"] = (legacy_evidence.get("source") or {}).get("inspection") or {}
+		legacy_copy["diagnosis"] = diagnosis
+		photo_ref = legacy_copy.get("photo_ref")
+		legacy_copy["photo_url"] = url_for("media_file", filename=photo_ref) if photo_ref and photo_ref.startswith(f"{org_id}/") else None
+		legacy_copy["evidence_url"] = url_for("record_detail", record_id=legacy_copy["record_id"])
+		wrong_package_alerts.append(legacy_copy)
+
+	contract_pack_records = list_contract_records(org_id, since=None, agent="pack", cursor=None, limit=20)
+	returns_webhook_configured = bool(RETURNS_AGENT_WEBHOOK_URL and RETURNS_AGENT_WEBHOOK_TOKEN and AGENT_API_ORG_ID == org_id)
+	for record in contract_pack_records:
+		checks = record.get("checks", [])
+		events = list_audit_events(record["record_id"], org_id)
+		delivery_event = next((event for event in events if event["event_type"] in {"RETURNS_AGENT_DELIVERED", "RETURNS_AGENT_FAILED"}), None)
+		latest_overrides = {item["check_key"]: item["to_verdict"] for item in record.get("overrides", [])}
+		check_verdicts = [latest_overrides.get(check["check_key"], check["verdict"]) for check in checks]
+		is_clear_seal = record.get("status") == "complete" and record.get("outcome", {}).get("decision") == "seal" and all(verdict == "pass" for verdict in check_verdicts)
+		if is_clear_seal and (not returns_webhook_configured or (delivery_event and delivery_event["event_type"] == "RETURNS_AGENT_DELIVERED")):
+			continue
+		sku_check = next((check for check in checks if check["check_key"] == "sku_quantity"), {})
+		sku_details = sku_check.get("detail", {}).get("sku_checks", [])
+		expected_lines = []
+		observed_lines = []
+		for item in sku_details:
+			sku = str(item.get("sku") or "").strip()
+			if not sku:
+				continue
+			expected_quantity = item.get("expected_quantity")
+			observed_quantity = item.get("observed_quantity")
+			if isinstance(expected_quantity, int):
+				expected_lines.append(f"{sku}:{expected_quantity}")
+			if isinstance(observed_quantity, int):
+				observed_lines.append(f"{sku}:{observed_quantity}")
+		subject = record.get("subject") or {}
+		if not expected_lines and subject.get("sku") and isinstance(subject.get("quantity_expected"), int):
+			expected_lines = [f"{subject['sku']}:{subject['quantity_expected']}"]
+		inspection = next((check.get("detail", {}) for check in checks if check["check_key"] == "visual_evidence"), {})
+		issue_parts = []
+		for check in checks:
+			if latest_overrides.get(check["check_key"], check["verdict"]) == "pass":
+				continue
+			detail = check.get("detail", {})
+			issue_parts.append(str(detail.get("reason") or detail.get("status") or check["check_key"].replace("_", " ")))
+			quality = detail.get("image_quality") or {}
+			if quality.get("reason"):
+				issue_parts.append(str(quality["reason"]))
+			issue_parts.extend(str(note) for note in detail.get("uncertainties", []) if note)
+		issue_summary = "; ".join(dict.fromkeys(issue_parts)) or "The contract Pack record is pending review."
+		verdict = "FAIL" if "fail" in check_verdicts or record.get("outcome", {}).get("decision") == "fix" else "UNCERTAIN"
+		first_image = next(iter(record.get("images", [])), None)
+		wrong_package_alerts.append({
+			"record_id": record["record_id"],
+			"order_id": subject.get("order_id") or "Order not supplied",
+			"unit_id": subject.get("shipment_id") or record["record_id"],
+			"verdict": verdict,
+			"action": str(record.get("outcome", {}).get("decision") or "manual_review").upper(),
+			"reason": issue_summary,
+			"order_lines": ";".join(expected_lines),
+			"observed_in_box": ";".join(observed_lines),
+			"diagnosis": {"issue_summary": issue_summary},
+			"inspection": inspection,
+			"photo_url": url_for("contract_record_image_api", record_id=record["record_id"], image_key=first_image["key"]) if first_image else None,
+			"evidence_url": url_for("contract_record_api", record_id=record["record_id"]),
+			"delivery_event": delivery_event,
+			"returns_webhook_configured": returns_webhook_configured,
+			"is_contract_record": True,
+		})
+
+	return render_template(
+		"alerts.html", alerts=alerts,
+		incoming_agent_alerts=incoming_agent_alerts,
+		wrong_package_alerts=wrong_package_alerts,
+		alert_count=len(alerts), active_org=org_id,
+		returns_webhook_configured=returns_webhook_configured,
+	)
+
+
+@app.post("/api/verify-pack")
+@login_required
+def api_verify_pack():
+	payload = request.get_json(silent=True) or request.form
+	expected = payload.get("expected", "").strip()
+	observed = payload.get("observed", "").strip()
+	org_id = current_org()
+	catalog = {p["sku"]: p["product_name"] for p in list_products(org_id)}
+	catalog.update(SAMPLE_PRODUCT_NAMES)
+	diag = diagnose_pack_contents(expected, observed, catalog_names=catalog)
+	return jsonify(diag)
+
 
 
 @app.get("/assistant")
@@ -767,7 +1298,120 @@ def assistant_api():
 	history = payload.get("history", [])
 	if not isinstance(history, list):
 		history = []
-	return jsonify({"answer": assistant_answer(question, current_org(), history)})
+	page_context = payload.get("page_context", {})
+	if not isinstance(page_context, dict):
+		page_context = {}
+	return jsonify({"answer": assistant_answer(question, current_org(), history, page_context)})
+
+
+@app.get("/agent-network")
+@app.get("/agent-hub")
+@login_required
+def agent_hub():
+	org_id = current_org()
+	prep_records = list_contract_records(org_id, since=None, agent="prep", cursor=None, limit=20)
+	prep_workflow = []
+	for record in prep_records:
+		subject = record.get("subject") or {}
+		checks = record.get("checks", [])
+		ready = prep_record_is_ready(record)
+		can_start = (
+			ready and bool(subject.get("order_id")) and bool(subject.get("sku"))
+			and isinstance(subject.get("quantity_expected"), int) and subject["quantity_expected"] > 0
+		)
+		prep_workflow.append({
+			"record": record,
+			"ready": ready,
+			"capture_url": url_for("capture", prep_record_id=record["record_id"]) if can_start else None,
+			"image_urls": [
+				url_for("contract_record_image_api", record_id=record["record_id"], image_key=image["key"])
+				for image in record.get("images", [])
+			],
+		})
+	pack_records = list_contract_records(org_id, since=None, agent="pack", cursor=None, limit=20)
+	pack_workflow = []
+	for record in pack_records:
+		events = list_audit_events(record["record_id"], org_id)
+		delivery_event = next((
+			event for event in events
+			if event["event_type"] in {"RETURNS_AGENT_DELIVERED", "RETURNS_AGENT_FAILED"}
+		), None)
+		visual_check = next((check for check in record.get("checks", []) if check["check_key"] == "visual_evidence"), {})
+		first_image = next(iter(record.get("images", [])), None)
+		pack_workflow.append({
+			"record": record,
+			"source_prep_record_id": next((
+				check.get("detail", {}).get("source_prep_record_id")
+				for check in record.get("checks", [])
+				if check["check_key"] == "sku_quantity"
+			), None),
+			"visual_status": visual_check.get("detail", {}).get("status", "PENDING"),
+			"candidate_decision": visual_check.get("detail", {}).get("candidate_decision", "MANUAL_REVIEW"),
+			"candidate_reason": visual_check.get("detail", {}).get("candidate_reason", "Vision has not produced a recommendation yet."),
+			"delivery_event": delivery_event,
+			"image_url": url_for(
+				"contract_record_image_api", record_id=record["record_id"], image_key=first_image["key"],
+			) if first_image else None,
+		})
+	return render_template(
+		"agent_hub.html",
+		prep_workflow=prep_workflow,
+		pack_workflow=pack_workflow,
+		returns_webhook_configured=bool(
+			RETURNS_AGENT_WEBHOOK_URL and RETURNS_AGENT_WEBHOOK_TOKEN
+			and AGENT_API_ORG_ID == org_id
+		),
+		active_org=org_id,
+	)
+
+
+@app.post("/v1/agent/records/<record_id>/retry")
+@login_required
+def retry_returns_agent_delivery(record_id: str):
+	record = get_contract_record(record_id, current_org())
+	if not record or record.get("agent") != "pack":
+		abort(404)
+	if not RETURNS_AGENT_WEBHOOK_URL or not RETURNS_AGENT_WEBHOOK_TOKEN:
+		abort(503, description="The Stage-4 webhook is not configured.")
+	publish_pack_record(record)
+	return redirect(url_for("alerts"))
+
+
+@app.post("/api/agent/transfer")
+@login_required
+def api_agent_transfer():
+	return jsonify({
+		"error": "Scenario transfers were a simulator and are no longer available. Submit a CUBE prep record and continue from Agent Network."
+	}), 410
+
+
+@app.get("/api/agent/transfers")
+@login_required
+def api_agent_list_transfers():
+	return jsonify({"error": "Simulated transfer history is retired; use the CUBE agent workflow."}), 410
+
+
+@app.get("/api/agent/transfers/<transfer_id>")
+@login_required
+def api_agent_get_transfer(transfer_id: str):
+	return jsonify({"error": "Simulated transfer transcripts are retired; use the CUBE agent workflow."}), 410
+
+
+@app.post("/api/agent/command")
+@login_required
+def api_agent_command():
+	payload = request.get_json(silent=True) or request.form
+	command = payload.get("command", "").strip()
+	if not command:
+		return jsonify({"answer": "Please provide a command or question for the PackGuard Agent."}), 400
+	if any(term in command.casefold() for term in ("transfer", "dispatch", "move", "ship")):
+		return jsonify({
+			"error": "PackGuard no longer simulates transfers. Start from a ready Stage-2 prep record and capture the outbound box."
+		}), 410
+	return jsonify({
+		"answer": agent_workflow_summary(current_org()),
+		"action_taken": "WORKFLOW_STATUS",
+	})
 
 
 @app.route("/capture", methods=["GET", "POST"])
@@ -776,6 +1420,72 @@ def capture():
 	org_id = current_org()
 	if request.method == "GET":
 		defaults = {"attempt_type": "initial", "recapture_reason": ""}
+		products = catalog_products(org_id)
+		prep_workflow = []
+		for prep_record in list_contract_records(org_id, since=None, agent="prep", cursor=None, limit=20):
+			prep_subject = prep_record.get("subject") or {}
+			prep_route = prep_record_logistics(prep_record)
+			prep_sku = str(prep_subject.get("sku") or "")
+			prep_product = next((product for product in products if product["sku"] == prep_sku), None)
+			prep_quantity = prep_subject.get("quantity_expected")
+			prep_ready = prep_record_is_ready(prep_record)
+			can_start = (
+				prep_ready and bool(prep_subject.get("order_id")) and bool(prep_sku)
+				and isinstance(prep_quantity, int) and prep_quantity > 0
+			)
+			prep_workflow.append({
+				"record_id": prep_record["record_id"],
+				"order_id": prep_subject.get("order_id"),
+				"shipment_id": prep_subject.get("shipment_id"),
+				"sku": prep_sku,
+				"product_name": prep_product["product_name"] if prep_product else prep_sku,
+				"quantity_expected": prep_quantity,
+				"decision": prep_record.get("outcome", {}).get("decision", "manual_review"),
+				"ready": prep_ready,
+				"logistics": prep_route,
+				"capture_url": url_for("capture", prep_record_id=prep_record["record_id"]) if can_start else None,
+			})
+		prep_record_id = request.args.get("prep_record_id", "").strip()
+		if prep_record_id:
+			prep_record = get_contract_record(prep_record_id, org_id)
+			if not prep_record or prep_record.get("agent") != "prep" or not prep_record_is_ready(prep_record):
+				abort(404)
+			subject = prep_record.get("subject") or {}
+			if not subject.get("order_id") or not subject.get("sku") or not isinstance(subject.get("quantity_expected"), int) or subject["quantity_expected"] <= 0:
+				abort(400, description="Stage-2 prep record must include order, SKU, and a positive expected quantity.")
+			product = next((item for item in products if item["sku"] == subject["sku"]), None)
+			logistics = prep_record_logistics(prep_record)
+			defaults.update({
+				"source_prep_record_id": prep_record_id,
+				"selected_product_id": product["product_id"] if product else "",
+				"product_lookup": product["product_name"] if product else subject["sku"],
+				"unit_id": subject.get("shipment_id") or "",
+				"order_id": subject["order_id"],
+				"order_lines": f"{subject['sku']}:{subject['quantity_expected']}",
+				**logistics,
+			})
+		product_lookup = request.args.get("product_id", "").strip() or request.args.get("sku", "").strip() or request.args.get("product", "").strip()
+		selected_product = next((
+			product for product in products
+			if product_lookup and product_lookup.casefold() in {
+				str(product.get("product_id") or "").casefold(),
+				str(product.get("sku") or "").casefold(),
+				str(product.get("barcode") or "").casefold(),
+				str(product.get("product_name") or "").casefold(),
+			}
+		), None)
+		if selected_product:
+			product_defaults = {
+				"selected_product_id": selected_product["product_id"],
+				"product_lookup": selected_product["product_name"],
+				"order_lines": f"{selected_product['sku']}:1",
+				"supplier_name": selected_product.get("supplier_name") or "",
+				"origin_address": selected_product.get("origin_address") or "",
+				"ordered_for": selected_product.get("ordered_for") or "",
+				"delivery_address": selected_product.get("delivery_address") or "",
+			}
+			if not prep_record_id:
+				defaults.update(product_defaults)
 		recapture_of = request.args.get("recapture_of", "").strip()
 		if recapture_of:
 			previous = get_record(recapture_of, org_id)
@@ -788,10 +1498,79 @@ def capture():
 					"delivery_address": previous["delivery_address"] or "", "order_lines": previous["order_lines"],
 					"attempt_type": "recapture", "parent_record_id": previous["record_id"],
 				})
-		return render_template("capture.html", products=catalog_products(org_id), defaults=defaults)
+				defaults["selected_product_id"] = selected_product["product_id"] if selected_product else ""
+		return render_template("capture.html", products=products, defaults=defaults, prep_workflow=prep_workflow)
 	form = request.form
 	order_lines = form.get("order_lines", "").strip()
 	observed_in_box = form.get("observed_in_box", "").strip()
+	source_prep_record_id = form.get("source_prep_record_id", "").strip() or None
+	source_prep_record = None
+	prep_subject = {}
+	prep_route = {}
+	if source_prep_record_id:
+		try:
+			UUID(source_prep_record_id)
+		except (ValueError, TypeError, AttributeError):
+			abort(400, description="Invalid Stage-2 prep record ID")
+		source_prep_record = get_contract_record(source_prep_record_id, org_id)
+		if not source_prep_record or source_prep_record.get("agent") != "prep" or not prep_record_is_ready(source_prep_record):
+			abort(400, description="A completed Stage-2 prep record with passing checks is required")
+		prep_subject = source_prep_record.get("subject") or {}
+		if not prep_subject.get("order_id") or not prep_subject.get("sku") or not isinstance(prep_subject.get("quantity_expected"), int) or prep_subject["quantity_expected"] <= 0:
+			abort(400, description="Stage-2 record must provide order, SKU, and positive expected quantity")
+		expected_from_prep = f"{prep_subject['sku']}:{prep_subject['quantity_expected']}"
+		if order_lines and order_lines != expected_from_prep:
+			abort(400, description="Expected SKU and quantity must match the Stage-2 prep record")
+		order_lines = expected_from_prep
+		submitted_order_id = form.get("order_id", "").strip()
+		if submitted_order_id and submitted_order_id != prep_subject["order_id"]:
+			abort(400, description="Order ID must match the Stage-2 prep record")
+		submitted_unit_id = form.get("unit_id", "").strip()
+		if submitted_unit_id and prep_subject.get("shipment_id") and submitted_unit_id != prep_subject["shipment_id"]:
+			abort(400, description="Shipment/unit ID must match the Stage-2 prep record")
+		prep_route = prep_record_logistics(source_prep_record)
+	products_by_id = {product["product_id"]: product for product in catalog_products(org_id)}
+	selected_product = products_by_id.get(form.get("selected_product_id", "").strip())
+	if selected_product and not order_lines:
+		order_lines = f"{selected_product['sku']}:1"
+	expected_skus = set(parse_lines(order_lines))
+	if selected_product and selected_product["sku"] not in expected_skus:
+		selected_product = None
+	products_by_sku = {product["sku"]: product for product in products_by_id.values()}
+	if source_prep_record:
+		prep_product = products_by_sku.get(str(prep_subject["sku"]))
+		if selected_product and selected_product["sku"] != prep_subject["sku"]:
+			abort(400, description="Selected product must match the Stage-2 prep record")
+		selected_product = prep_product
+	product_routes = [
+		{
+			"product_id": products_by_sku[sku]["product_id"],
+			"sku": sku,
+			"product_name": products_by_sku[sku]["product_name"],
+			"supplier_name": products_by_sku[sku].get("supplier_name"),
+			"origin_address": products_by_sku[sku].get("origin_address"),
+			"ordered_for": products_by_sku[sku].get("ordered_for"),
+			"delivery_address": products_by_sku[sku].get("delivery_address"),
+		}
+		for sku in sorted(expected_skus) if sku in products_by_sku
+	]
+	if source_prep_record:
+		prep_route_snapshot = {
+			"product_id": selected_product["product_id"] if selected_product else None,
+			"sku": prep_subject["sku"],
+			"product_name": selected_product["product_name"] if selected_product else prep_subject["sku"],
+			**prep_route,
+			"source_prep_record_id": source_prep_record_id,
+		}
+		product_routes = [item for item in product_routes if item["sku"] != prep_subject["sku"]]
+		product_routes.append(prep_route_snapshot)
+	primary_product = selected_product or (products_by_sku.get(next(iter(expected_skus))) if len(expected_skus) == 1 else None)
+	supplier_name = prep_route.get("supplier_name") or form.get("supplier_name", "").strip() or (primary_product or {}).get("supplier_name")
+	origin_address = prep_route.get("origin_address") or form.get("origin_address", "").strip() or (primary_product or {}).get("origin_address")
+	delivery_address = prep_route.get("delivery_address") or form.get("delivery_address", "").strip() or (primary_product or {}).get("delivery_address")
+	unit_id = form.get("unit_id", "").strip() or (prep_subject.get("shipment_id") if source_prep_record else None) or f"UNIT-{uuid4().hex[:8].upper()}"
+	order_id = form.get("order_id", "").strip() or (prep_subject.get("order_id") if source_prep_record else None) or f"ORD-LOCAL-{uuid4().hex[:8].upper()}"
+	operator_id = form.get("operator_id", "").strip() or session.get("username", "operator")
 	attempt_type = form.get("attempt_type", "initial").strip().lower()
 	recapture_reason = form.get("recapture_reason", "").strip()
 	if attempt_type not in {"initial", "recapture"}:
@@ -806,8 +1585,12 @@ def capture():
 			abort(400, description="A recapture must reference an existing record in this organization")
 		if form.get("order_id", "").strip() != parent_record["order_id"] or form.get("unit_id", "").strip() != parent_record["unit_id"]:
 			abort(400, description="Recapture order and unit must match the original pack session")
-		if form.get("supplier_name", "").strip() != (parent_record.get("supplier_name") or ""):
+		submitted_supplier = form.get("supplier_name", "").strip()
+		if submitted_supplier and submitted_supplier != (parent_record.get("supplier_name") or ""):
 			abort(400, description="Recapture supplier must match the original receiving session")
+		supplier_name = parent_record.get("supplier_name")
+		origin_address = form.get("origin_address", "").strip() or parent_record.get("origin_address")
+		delivery_address = form.get("delivery_address", "").strip() or parent_record.get("delivery_address")
 	result = verify_pack(order_lines, observed_in_box)
 	attach_catalog_metadata(result, org_id)
 	record_id = f"PCK-{uuid4().hex[:8].upper()}"
@@ -815,17 +1598,29 @@ def capture():
 	video_ref = save_media(request.files.get("packing_video"), org_id, record_id, "video")
 	photo_ref = photo_ref or form.get("photo_ref", "").strip() or None
 	image_observation = observe(observed_in_box)
-	vision_candidates = vision_catalog_products(org_id, set(parse_lines(order_lines)))
+	expected_skus = set(parse_lines(order_lines))
+	vision_candidates = vision_catalog_products(org_id, expected_skus)
 	if photo_ref and photo_ref.startswith(f"{org_id}/"):
 		photo_input = MEDIA_STORAGE.read(photo_ref) or photo_ref
 	elif photo_ref and photo_ref.startswith("fixtures/vision/"):
 		photo_input = APP_DIR / photo_ref
 	else:
 		photo_input = None
+	configured_vision_model = os.environ.get("PACKGUARD_VISION_MODEL", "").strip()
+	fast_presence_mode = (
+		photo_input is not None
+		and not observed_in_box
+		and len(expected_skus) == 1
+		and (not configured_vision_model or configured_vision_model.lower().startswith("moondream"))
+	)
+	if fast_presence_mode:
+		vision_candidates = [product for product in vision_candidates if product.get("sku") in expected_skus]
 	vision_result = inspect_image(
 		photo_input,
 		catalog_products=vision_candidates,
 		photo_name=Path(photo_ref).name if photo_ref else None,
+		model_override=configured_vision_model or ("moondream:1.8b" if fast_presence_mode else None),
+		force_structured=not fast_presence_mode,
 	)
 	if vision_result.get("status") == "SUGGESTIONS_READY_UNCALIBRATED":
 		candidate_skus = {product["sku"] for product in vision_candidates}
@@ -869,8 +1664,26 @@ def capture():
 					"The local vision result is an uncalibrated suggestion. "
 					"A human must confirm the contents before a final packing decision."
 				)
+	image_workflow = run_pack_agent_workflow(
+		vision_result,
+		expected_lines=order_lines,
+		observed_contents=observed_in_box,
+	)
+	vision_result["candidate_decision"] = image_workflow["candidate_decision"]
+	vision_result["candidate_reason"] = image_workflow["candidate_reason"]
+	vision_result["agent_run"] = image_workflow["trace"]
 	if not observed_in_box:
 		result = enforce_component_verdict(result, vision_result, bool(photo_ref))
+		if image_workflow["decision"] == "fix":
+			result.update({
+				"verdict": "FAIL", "action": "STOP_AND_FIX", "decision": "FIX",
+				"reason": image_workflow["candidate_reason"],
+			})
+		elif image_workflow["decision"] == "recapture":
+			result.update({
+				"verdict": "UNCERTAIN", "action": "HOLD_FOR_REVIEW", "decision": "RECAPTURE",
+				"reason": image_workflow["candidate_reason"],
+			})
 	vision_result["auto_seal_policy"] = auto_seal_policy(None, vision_result)
 	operator_verdict = form.get("operator_verdict", "").strip().lower()
 	result = require_operator_confirmation(result, operator_verdict)
@@ -898,26 +1711,42 @@ def capture():
 		attempt_number = 1
 		parent_record_id = None
 	evidence = build_evidence(
-		record_id=record_id, org_id=org_id, unit_id=form.get("unit_id", "").strip() or "UNIT-NEW",
+		record_id=record_id, org_id=org_id, unit_id=unit_id,
 		order_lines=order_lines, observed_in_box=observed_in_box,
-		supplier_name=form.get("supplier_name", "").strip() or None,
+		supplier_name=supplier_name or None,
 		result=result, photo_ref=photo_ref, image_observation=image_observation,
 		vision_result=vision_result,
 		operator_verdict=operator_verdict, agreement=agreement,
 		video_ref=video_ref,
 	)
+	evidence["source"]["product_routes"] = product_routes
+	stage3_contract_record = None
+	if source_prep_record_id:
+		evidence["source"]["source_prep_record_id"] = source_prep_record_id
+		stage3_contract_record = build_stage3_contract_record(
+			organization_key=org_id,
+			prep_record=source_prep_record,
+			operator_label=operator_id,
+			expected_lines=order_lines,
+			observed_contents=observed_in_box,
+			pack_result=result,
+			vision_result=vision_result,
+			product_routes=product_routes,
+			photo_ref=photo_ref,
+		)
+		evidence["source"]["stage3_contract_record_id"] = stage3_contract_record["record_id"]
 	save_record({
 		"record_id": record_id, "org_id": org_id,
-		"unit_id": form.get("unit_id", "").strip() or "UNIT-NEW",
-		"order_id": form.get("order_id", "").strip() or "ORD-NEW",
-		"supplier_name": form.get("supplier_name", "").strip() or None,
+		"unit_id": unit_id,
+		"order_id": order_id,
+		"supplier_name": supplier_name or None,
 		"channel": form.get("channel", "amazon_mfn"),
-		"origin_address": form.get("origin_address", "").strip() or None,
-		"delivery_address": form.get("delivery_address", "").strip() or None,
+		"origin_address": origin_address or None,
+		"delivery_address": delivery_address or None,
 		"order_lines": order_lines, "observed_in_box": observed_in_box,
 		"operator_verdict": operator_verdict,
 		"video_ref": video_ref,
-		"operator_id": session.get("username", "operator") if IS_PRODUCTION else form.get("operator_id", "operator"),
+		"operator_id": session.get("username", "operator") if IS_PRODUCTION else operator_id,
 		"photo_ref": photo_ref,
 		"captured_at": datetime.now(timezone.utc).isoformat(),
 		"verdict": result["verdict"], "action": result["action"],
@@ -932,7 +1761,7 @@ def capture():
 		"org_id": org_id,
 		"event_type": "RECAPTURE" if attempt_type == "recapture" else "CAPTURED",
 		"reason": recapture_reason if attempt_type == "recapture" else "Initial packing capture",
-		"actor_id": form.get("operator_id", "operator"),
+		"actor_id": operator_id,
 		"created_at": datetime.now(timezone.utc).isoformat(),
 		"details": {"decision": result.get("decision"), "verdict": result["verdict"], "session_id": session_id, "attempt_number": attempt_number, "parent_record_id": parent_record_id},
 	})
@@ -943,7 +1772,7 @@ def capture():
 			"org_id": org_id,
 			"event_type": "OPERATOR_OVERRIDE",
 			"reason": override_reason or "Legacy demo override",
-			"actor_id": form.get("operator_id", "operator"),
+			"actor_id": operator_id,
 			"created_at": datetime.now(timezone.utc).isoformat(),
 			"details": {
 				"operator_verdict": operator_verdict,
@@ -951,13 +1780,54 @@ def capture():
 				"deterministic_decision": result.get("decision"),
 			},
 		})
+	if stage3_contract_record:
+		try:
+			persistence_status = save_contract_record(stage3_contract_record, org_id)
+			if persistence_status == "created":
+				publish_pack_record(stage3_contract_record)
+		except Exception:
+			app.logger.exception("Could not persist Stage-3 CUBE output for prep source %s", source_prep_record_id)
+			save_audit_event({
+				"event_id": f"AGT-{uuid4().hex[:12].upper()}",
+				"record_id": record_id,
+				"org_id": org_id,
+				"event_type": "STAGE3_HANDOFF_FAILED",
+				"reason": "Stage-3 CUBE output could not be persisted; retry or inspect server logs.",
+				"actor_id": "agent:packguard_stage3",
+				"created_at": utc_now(),
+				"details": {"source_prep_record_id": source_prep_record_id},
+			})
 	return redirect(url_for("record_detail", record_id=record_id, org_id=org_id))
 
 
 @app.get("/capture/contract")
 @login_required
 def contract_capture_page():
-	return render_template("contract_capture.html", direct_upload_enabled=MEDIA_STORAGE.backend == "s3")
+	defaults = {}
+	prep_record_id = request.args.get("prep_record_id", "").strip()
+	if prep_record_id:
+		prep_record = get_contract_record(prep_record_id, current_org())
+		if not prep_record or prep_record.get("agent") != "prep" or not prep_record_is_ready(prep_record):
+			abort(404)
+		subject = prep_record["subject"]
+		if (
+			not subject.get("order_id") or not subject.get("sku")
+			or not isinstance(subject.get("quantity_expected"), int)
+			or subject["quantity_expected"] <= 0
+		):
+			abort(400, description="The prep record is missing the order, SKU, or expected quantity required for pack capture.")
+		defaults = {
+			"order_id": subject["order_id"],
+			"shipment_id": subject.get("shipment_id") or "",
+			"sku": subject["sku"],
+			"quantity_expected": subject["quantity_expected"],
+			"source_record_id": prep_record_id,
+		}
+	return render_template(
+		"contract_capture.html",
+		direct_upload_enabled=MEDIA_STORAGE.backend == "s3",
+		defaults=defaults,
+	)
 
 
 @app.get("/records/<record_id>")
@@ -1072,6 +1942,7 @@ def records_api():
 
 def _contract_vision_job(record_id: str, organization_key: str, capture: dict[str, Any], record: dict[str, Any]) -> None:
 	try:
+		input_data = json.loads(capture["input_json"])
 		slots = json.loads(capture["image_slots_json"])
 		images = []
 		for slot in slots:
@@ -1080,21 +1951,29 @@ def _contract_vision_job(record_id: str, organization_key: str, capture: dict[st
 				return
 			images.append((image_bytes, Path(slot["key"]).name))
 		first_image, *additional_images = images
-		expected_skus = set(parse_lines(json.loads(capture["input_json"]).get("expected_lines", "")))
+		expected_skus = set(parse_lines(input_data.get("expected_lines", "")))
 		vision_products = vision_catalog_products(organization_key, expected_skus)
+		configured_model = os.environ.get("PACKGUARD_CONTRACT_VISION_MODEL", "").strip()
+		fast_presence_mode = (
+			not input_data.get("observed_contents", "").strip()
+			and len(expected_skus) == 1
+			and (not configured_model or configured_model.lower().startswith("moondream"))
+		)
+		if fast_presence_mode:
+			vision_products = [product for product in vision_products if product.get("sku") in expected_skus]
+		model_override = configured_model or ("moondream:1.8b" if fast_presence_mode else "gemma3:4b")
 		vision_result = inspect_image(
 			first_image[0],
 			catalog_products=vision_products,
 			photo_name=first_image[1],
 			additional_images=additional_images,
-			model_override=os.environ.get("PACKGUARD_CONTRACT_VISION_MODEL", "gemma3:4b"),
-			force_structured=True,
+			model_override=model_override,
+			force_structured=not fast_presence_mode,
 			capture_context={
-				"expected_lines": json.loads(capture["input_json"]).get("expected_lines", ""),
+				"expected_lines": input_data.get("expected_lines", ""),
 				"check_keys": ["sku_quantity", "visual_evidence"],
 			},
 		)
-		input_data = json.loads(capture["input_json"])
 		workflow = run_pack_agent_workflow(
 			vision_result,
 			expected_lines=input_data.get("expected_lines", ""),
@@ -1110,9 +1989,13 @@ def _contract_vision_job(record_id: str, organization_key: str, capture: dict[st
 			"image_quality": vision_result.get("image_quality", {}),
 			"occlusion": vision_result.get("occlusion", {}),
 			"uncertainties": vision_result.get("uncertainties", []),
+			"presence_hint": vision_result.get("presence_hint"),
 			"token_usage": vision_result.get("token_usage"),
 			"confidence": vision_result.get("confidence"),
 			"vision_observation_candidate": workflow["vision_observation"] or None,
+			"candidate_decision": workflow["candidate_decision"],
+			"candidate_reason": workflow["candidate_reason"],
+			"automatic_seal_authorized": False,
 			"agent_run": workflow["trace"],
 		}
 		record["status"] = "pending" if vision_result.get("status") in FAILED_VISION_STATUSES else "complete"
@@ -1123,7 +2006,8 @@ def _contract_vision_job(record_id: str, organization_key: str, capture: dict[st
 		}
 		record["content_hash"] = content_hash(record["images"], record["checks"])
 		validate_record(record)
-		update_contract_record(record, organization_key)
+		if update_contract_record(record, organization_key):
+			publish_pack_record(record)
 	except Exception:
 		app.logger.exception("CUBE vision job failed for record %s", record_id)
 
@@ -1153,6 +2037,28 @@ def contract_create_capture():
 			UUID(client_id)
 	except (ValueError, TypeError, AttributeError):
 		return jsonify({"error": "client_id must be a UUID or null."}), 400
+	source_record_id = payload.get("source_record_id")
+	if source_record_id is not None:
+		try:
+			UUID(source_record_id)
+		except (ValueError, TypeError, AttributeError):
+			return jsonify({"error": "source_record_id must be a UUID or null."}), 400
+		prep_record = get_contract_record(source_record_id, organization_key)
+		if not prep_record or prep_record.get("agent") != "prep" or not prep_record_is_ready(prep_record):
+			return jsonify({"error": "A completed prep record with passing checks in this organization is required as the source."}), 400
+		prep_subject = prep_record["subject"]
+		if not isinstance(prep_subject.get("quantity_expected"), int) or prep_subject["quantity_expected"] <= 0:
+			return jsonify({"error": "The prep source record must provide a positive expected quantity."}), 400
+		if (
+			subject.get("order_id") != prep_subject.get("order_id")
+			or subject.get("sku") != prep_subject.get("sku")
+			or subject.get("quantity_expected") != prep_subject.get("quantity_expected")
+			or subject.get("shipment_id") != prep_subject.get("shipment_id")
+		):
+			return jsonify({"error": "Pack capture order, SKU, quantity, and shipment must match the prep source record."}), 400
+		expected_from_source = f"{prep_subject['sku']}:{prep_subject['quantity_expected']}"
+		if str(payload.get("expected_lines", "")).strip() != expected_from_source:
+			return jsonify({"error": "Expected lines must match the prep source record."}), 400
 	image_slots = payload.get("image_slots")
 	if not isinstance(image_slots, list) or len(image_slots) not in {2, 3}:
 		return jsonify({"error": "Provide two or three guided image slots."}), 400
@@ -1181,6 +2087,7 @@ def contract_create_capture():
 	input_data = {
 		"expected_lines": str(payload.get("expected_lines", ""))[:4000],
 		"observed_contents": str(payload.get("observed_contents", ""))[:4000],
+		"source_record_id": source_record_id,
 	}
 	capture = {
 		"capture_id": capture_id,
@@ -1265,7 +2172,11 @@ def contract_complete_capture(capture_id: str):
 		"check_key": "sku_quantity",
 		"verdict": verdict,
 		"confidence": None,
-		"detail": {"sku_checks": sku_details, "reason": verification["reason"]},
+		"detail": {
+			"sku_checks": sku_details,
+			"reason": verification["reason"],
+			"source_prep_record_id": input_data.get("source_record_id"),
+		},
 		"model_version": "deterministic-packguard-v1.1",
 		"latency_ms": deterministic_latency,
 	}, {
@@ -1370,6 +2281,84 @@ def contract_records_api():
 	return jsonify({"records": records, "next_cursor": next_cursor})
 
 
+@app.post("/v1/agent/records")
+@csrf.exempt
+def agent_ingest_prep_record():
+	organization_key, auth_error = agent_api_org(PREP_AGENT_API_TOKEN)
+	if auth_error:
+		return auth_error
+	record = request.get_json(silent=True)
+	if not isinstance(record, dict):
+		return jsonify({"error": "A CUBE evidence record is required."}), 400
+	try:
+		validate_record(record)
+	except (KeyError, TypeError, ValueError) as error:
+		return jsonify({"error": str(error)}), 400
+	if record["organization_id"] != organization_uuid(organization_key):
+		return jsonify({"error": "The record belongs to a different organization."}), 403
+	if record["agent"] != "prep" or record["status"] != "complete":
+		return jsonify({"error": "Only completed agent=prep records can be ingested."}), 400
+	for image in record["images"]:
+		if not image["key"].startswith(f"{record['organization_id']}/"):
+			return jsonify({"error": "Prep evidence images must use the organization's private storage prefix."}), 400
+		try:
+			image_bytes = MEDIA_STORAGE.read(image["key"])
+		except Exception:
+			image_bytes = None
+		if (
+			image_bytes is None
+			or len(image_bytes) != image["bytes"]
+			or hashlib.sha256(image_bytes).hexdigest() != image["sha256"]
+		):
+			return jsonify({"error": "A prep evidence image is missing or does not match its recorded digest."}), 409
+	save_result = save_contract_record(record, organization_key)
+	if save_result == "conflict":
+		return jsonify({"error": "This record ID already exists with different content."}), 409
+	return jsonify({"record_id": record["record_id"], "status": save_result}), 201 if save_result == "created" else 200
+
+
+@app.get("/v1/agent/records")
+def agent_pack_records_feed():
+	organization_key, auth_error = agent_api_org(PACK_FEED_AGENT_API_TOKEN)
+	if auth_error:
+		return auth_error
+	agent_name = request.args.get("agent", "pack")
+	if agent_name != "pack":
+		return jsonify({"error": "The agent feed exposes agent=pack records only."}), 400
+	since = request.args.get("since")
+	if since:
+		try:
+			parsed_since = datetime.fromisoformat(since.replace("Z", "+00:00"))
+			if parsed_since.tzinfo is None:
+				raise ValueError
+			since = parsed_since.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+		except ValueError:
+			return jsonify({"error": "since must be an ISO 8601 timestamp with timezone."}), 400
+	cursor = None
+	encoded_cursor = request.args.get("cursor")
+	if encoded_cursor:
+		try:
+			captured_at, cursor_id = urlsafe_b64decode(encoded_cursor.encode("ascii")).decode("utf-8").split("\n", 1)
+			cursor = (captured_at, cursor_id)
+		except Exception:
+			return jsonify({"error": "Invalid pagination cursor."}), 400
+	try:
+		limit = min(100, max(1, int(request.args.get("limit", "50"))))
+	except ValueError:
+		return jsonify({"error": "limit must be an integer."}), 400
+	records = list_contract_records(
+		organization_key, since=since, agent="pack", cursor=cursor, limit=limit + 1,
+	)
+	next_cursor = None
+	if len(records) > limit:
+		last_record = records[limit - 1]
+		next_cursor = urlsafe_b64encode(
+			f"{last_record['captured_at']}\n{last_record['record_id']}".encode("utf-8")
+		).decode("ascii")
+		records = records[:limit]
+	return jsonify({"records": records, "next_cursor": next_cursor})
+
+
 @app.post("/v1/records/<record_id>/overrides")
 @login_required
 def contract_record_override_api(record_id: str):
@@ -1461,7 +2450,8 @@ def vision_fixtures_page():
 					continue
 				row["image_url"] = url_for("media_file", filename=f"fixtures/vision/{filename}")
 				fixtures.append(row)
-	return render_template("vision_fixtures.html", fixtures=fixtures)
+	products_by_sku = {product["sku"]: product for product in list_products(current_org())}
+	return render_template("vision_fixtures.html", fixtures=fixtures, products_by_sku=products_by_sku)
 
 
 @app.get("/evaluation/fixtures/image/<filename>")

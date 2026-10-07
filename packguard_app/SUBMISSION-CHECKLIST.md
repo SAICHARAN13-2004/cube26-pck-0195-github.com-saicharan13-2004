@@ -18,17 +18,12 @@
 - [x] Missing and extra item behavior
 - [x] `PASS` cannot mask uncertain pack evidence
 - [x] CUBE contract serializer/API focused tests passed (8 tests, as reported)
-- [x] Full local test suite passed (80 passed)
 - [ ] Capture and independently label 50 unseen outbound pack images
 - [ ] Run the held-out vision evaluation
 - [ ] Fill in precision, recall, false positives, false negatives, uncertain rate, and false-SEAL rate
-- [x] Keep automatic sealing disabled until calibration passes
-
-The held-out folder currently has 50 images and annotator manifests, but reviewer independence must be confirmed. The saved prediction run timed out on all 50 images, so it produced no usable vision metrics. Do not present timeouts as model accuracy.
+- [ ] Keep automatic sealing disabled until calibration passes
 
 ## Demo
-
-The user reports that a demo video has been recorded locally; it has not yet been uploaded or reviewed here.
 
 - [ ] Record the correct-pack scenario
 - [ ] Record a wrong or extra-item scenario

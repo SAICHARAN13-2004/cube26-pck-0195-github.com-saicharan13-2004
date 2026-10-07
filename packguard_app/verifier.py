@@ -171,3 +171,124 @@ def verify_receiving_components(values: Any) -> list[dict[str, Any]]:
 		reason = "All expected components are present." if status == "PASS" else "Component mismatch (" + "; ".join(details) + ")."
 	checks.append({"check": "missing_components", "status": status, "reason": reason, "source": "operator_observation"})
 	return checks
+
+
+def diagnose_pack_contents(
+	order_lines: str,
+	observed_in_box: str | None,
+	catalog_names: dict[str, str] | None = None,
+) -> dict[str, Any]:
+	"""Diagnose packing discrepancies with detailed item-level analysis.
+	
+	Identifies:
+	  - Items present
+	  - Missing items
+	  - Incorrect / wrong items (replaced items)
+	  - Incorrect quantities
+	  - Unexpected extra items
+	Produces final operational decision: SEAL, STOP & FIX, or UNCERTAIN.
+	"""
+	catalog_names = catalog_names or {}
+	verification = verify_pack(order_lines, observed_in_box)
+
+	expected = verification.get("expected", {})
+	observed = verification.get("observed", {})
+	verdict = verification.get("verdict", "UNCERTAIN")
+
+	if verdict == "UNCERTAIN":
+		return {
+			"status": "HOLD FOR REVIEW",
+			"decision": "UNCERTAIN",
+			"operational_verdict": "UNCERTAIN",
+			"is_wrong_package": False,
+			"issues": [verification.get("reason", "Ambiguous evidence or unreadable packaging prevents reliable comparison.")],
+			"issue_summary": verification.get("reason", "Ambiguous evidence."),
+			"items_present": [],
+			"missing_items": [],
+			"wrong_items": [],
+			"extra_items": [],
+			"quantity_mismatches": [],
+			"verification": verification,
+		}
+
+	items_present = []
+	missing_items = []
+	extra_items = []
+	quantity_mismatches = []
+
+	for sku, exp_qty in expected.items():
+		obs_qty = observed.get(sku, 0)
+		name = catalog_names.get(sku, sku)
+		if obs_qty == 0:
+			missing_items.append({"sku": sku, "name": name, "expected": exp_qty, "observed": 0})
+		elif obs_qty == exp_qty:
+			items_present.append({"sku": sku, "name": name, "quantity": exp_qty})
+		else:
+			items_present.append({"sku": sku, "name": name, "quantity": obs_qty})
+			quantity_mismatches.append({
+				"sku": sku,
+				"name": name,
+				"expected": exp_qty,
+				"observed": obs_qty,
+				"difference": obs_qty - exp_qty,
+			})
+
+	for sku, obs_qty in observed.items():
+		if sku not in expected and obs_qty > 0:
+			name = catalog_names.get(sku, sku)
+			extra_items.append({"sku": sku, "name": name, "observed": obs_qty})
+
+	# Pair missing items with extra items to detect Replaced / Wrong items
+	wrong_items = []
+	unpaired_missing = list(missing_items)
+	unpaired_extra = list(extra_items)
+
+	while unpaired_missing and unpaired_extra:
+		m = unpaired_missing.pop(0)
+		e = unpaired_extra.pop(0)
+		wrong_items.append({
+			"expected_sku": m["sku"],
+			"expected_name": m["name"],
+			"expected_quantity": m["expected"],
+			"detected_sku": e["sku"],
+			"detected_name": e["name"],
+			"detected_quantity": e["observed"],
+		})
+
+	issues = []
+	for w in wrong_items:
+		issues.append(f"Expected {w['expected_name']}, Detected {w['detected_name']}")
+	for m in unpaired_missing:
+		issues.append(f"Missing item: {m['expected']} × {m['name']}")
+	for e in unpaired_extra:
+		issues.append(f"Unexpected extra item: {e['observed']} × {e['name']}")
+	for q in quantity_mismatches:
+		diff_str = f"+{q['difference']}" if q['difference'] > 0 else str(q['difference'])
+		issues.append(f"Incorrect quantity for {q['name']}: expected {q['expected']}, detected {q['observed']} ({diff_str})")
+
+	is_wrong = bool(wrong_items or unpaired_missing or unpaired_extra or quantity_mismatches)
+
+	if not is_wrong and verdict == "PASS":
+		status_text = "SEAL"
+		op_decision = "SEAL"
+		issue_summary = "All items verified: exact quantities matched, no discrepancies."
+	else:
+		status_text = "STOP & FIX"
+		op_decision = "STOP & FIX"
+		issue_summary = "; ".join(issues) if issues else "Contents do not match the expected order."
+
+	return {
+		"status": status_text,
+		"decision": op_decision,
+		"operational_verdict": "SEAL" if not is_wrong else "STOP & FIX",
+		"is_wrong_package": is_wrong,
+		"issues": issues,
+		"issue_summary": issue_summary,
+		"items_present": items_present,
+		"missing_items": missing_items,
+		"wrong_items": wrong_items,
+		"extra_items": extra_items,
+		"quantity_mismatches": quantity_mismatches,
+		"verification": verification,
+	}
+

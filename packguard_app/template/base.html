@@ -5,14 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}PackGuard{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260928-pastel-mix-1') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/theme-overrides.css', v='20260929-receiving-checks-1') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/theme-new.css', v='20261005-ops-refresh-3') }}">
 </head>
-<body>
+<body id="packguard-app">
   <header class="topbar">
-    <div class="topbar-main"><a class="brand" href="{{ url_for('dashboard', org_id=active_org) }}"><span class="brand-mark">P</span><span>PackGuard</span></a><button class="menu-toggle" type="button" aria-controls="primary-nav" aria-expanded="false"><b>Menu</b></button><div class="topbar-meta"><span class="live-dot"></span> Pack station online</div><div class="org-switcher"><span>{{ active_org }}</span><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="text-button" type="submit">Log out</button></form></div></div>
-    <nav id="primary-nav" class="topnav" aria-label="Primary navigation"><a class="{{ 'active' if request.endpoint == 'dashboard' else '' }}" href="{{ url_for('dashboard') }}">Dashboard</a><a class="{{ 'active' if request.endpoint == 'alerts' else '' }}" href="{{ url_for('alerts') }}">Alerts</a><a class="{{ 'active' if request.endpoint == 'product_catalog' or request.endpoint == 'product_detail' else '' }}" href="{{ url_for('product_catalog') }}">Catalog</a><a class="{{ 'active' if request.endpoint == 'vision_fixtures_page' or request.endpoint == 'vision_fixture_image' else '' }}" href="{{ url_for('vision_fixtures_page') }}">Vision set</a><a class="{{ 'active' if request.endpoint == 'assistant_page' or request.endpoint == 'assistant_api' else '' }}" href="{{ url_for('assistant_page') }}">Assistant</a><a class="{{ 'active' if request.endpoint == 'support_page' else '' }}" href="{{ url_for('support_page') }}">Support</a></nav>
-    <nav id="primary-nav" class="topnav" aria-label="Primary navigation"><a class="{{ 'active' if request.endpoint == 'dashboard' else '' }}" href="{{ url_for('dashboard') }}">Dashboard</a><a class="{{ 'active' if request.endpoint == 'alerts' else '' }}" href="{{ url_for('alerts') }}">Alerts</a><a class="{{ 'active' if request.endpoint == 'product_catalog' or request.endpoint == 'product_detail' else '' }}" href="{{ url_for('product_catalog') }}">Catalog</a><a class="{{ 'active' if request.endpoint == 'vision_fixtures_page' or request.endpoint == 'vision_fixture_image' else '' }}" href="{{ url_for('vision_fixtures_page') }}">Vision set</a><a class="{{ 'active' if request.endpoint == 'assistant_page' or request.endpoint == 'assistant_api' else '' }}" href="{{ url_for('assistant_page') }}">Assistant</a><a class="{{ 'active' if request.endpoint == 'support_page' else '' }}" href="{{ url_for('support_page') }}">Support</a></nav>
+    <div class="topbar-main"><a class="brand" href="{{ url_for('dashboard', org_id=active_org) }}"><span class="brand-mark">P</span><span>PackGuard</span></a><button class="menu-toggle" type="button" aria-controls="primary-nav" aria-expanded="false"><b>Menu</b></button><div class="topbar-meta"><span class="live-dot"></span> Pack verification · {{ active_org }}</div><div class="org-switcher"><span>{{ active_org }}</span></div><div class="topbar-actions"><button id="global-assistant-toggle" class="header-icon-button" type="button" aria-label="Open assistant" aria-controls="global-assistant-panel" aria-expanded="false" title="Assistant"><span class="action-emoji" aria-hidden="true">💬</span></button><a class="header-icon-button {{ 'active' if request.endpoint == 'alerts' else '' }}" href="{{ url_for('alerts') }}" aria-label="Open alerts" title="Alerts"><span class="action-emoji" aria-hidden="true">🔔</span></a><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="header-icon-button" type="submit" aria-label="Log out" title="Log out"><span class="action-emoji" aria-hidden="true">🚪</span></button></form></div></div>
+    <nav id="primary-nav" class="topnav" aria-label="Primary navigation"><a class="{{ 'active' if request.endpoint == 'dashboard' else '' }}" href="{{ url_for('dashboard') }}">Dashboard</a><a class="{{ 'active' if request.endpoint == 'capture' else '' }}" href="{{ url_for('capture') }}">New check</a><a class="{{ 'active' if request.endpoint == 'product_catalog' or request.endpoint == 'product_detail' else '' }}" href="{{ url_for('product_catalog') }}">Catalog</a><a class="{{ 'active' if request.endpoint == 'vision_fixtures_page' or request.endpoint == 'vision_fixture_image' else '' }}" href="{{ url_for('vision_fixtures_page') }}">Vision set</a><a class="{{ 'active' if request.endpoint == 'support_page' else '' }}" href="{{ url_for('support_page') }}">Support</a></nav>
   </header>
+  <aside id="global-assistant-panel" class="global-assistant-panel" role="dialog" aria-label="PackGuard assistant" aria-modal="false" hidden>
+    <header class="global-assistant-header"><div><p class="eyebrow">Workspace assistant</p><h2>PackGuard assistant</h2><small>{{ active_org }} · context-aware</small></div><button id="global-assistant-close" class="header-icon-button" type="button" aria-label="Close assistant" title="Close"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg></button></header>
+    <div class="global-assistant-prompts"><button type="button" data-global-question="What is happening on this page?">This page</button><button type="button" data-global-question="Show my current workflow status">Workflow status</button><button type="button" data-global-question="What needs my attention?">Needs attention</button></div>
+    <div id="global-assistant-chat" class="global-assistant-chat" role="log" aria-live="polite" aria-relevant="additions"><div class="assistant-message assistant-message-bot"><span class="assistant-message-label">PackGuard assistant</span><p>Ask about the current page, products, checks, or workflow.</p></div></div>
+    <form id="global-assistant-form" class="assistant-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input id="global-assistant-question" name="question" placeholder="Ask about this page or workspace" autocomplete="off"><button class="button button-primary" type="submit" aria-label="Send question">Send <span>→</span></button></form>
+  </aside>
   <main class="shell">{% block content %}{% endblock %}</main>
   <footer class="footer"><span>Evidence-first outbound checks</span><span class="footer-links"><a href="{{ url_for('records_api') }}">Export JSON</a><a href="{{ url_for('records_csv') }}">Export CSV</a><a href="{{ url_for('evaluation_summary') }}">Evaluation summary</a></span></footer>
   <script>
@@ -22,6 +27,102 @@
       const isOpen = primaryNav.classList.toggle('is-open');
       menuToggle.setAttribute('aria-expanded', String(isOpen));
       menuToggle.classList.toggle('is-open', isOpen);
+    });
+    const assistantToggle = document.getElementById('global-assistant-toggle');
+    const assistantPanel = document.getElementById('global-assistant-panel');
+    const assistantClose = document.getElementById('global-assistant-close');
+    const assistantForm = document.getElementById('global-assistant-form');
+    const assistantInput = document.getElementById('global-assistant-question');
+    const assistantChat = document.getElementById('global-assistant-chat');
+    const assistantSend = assistantForm?.querySelector('button[type="submit"]');
+    const assistantHistoryKey = 'packguard-assistant-history';
+    let assistantHistory = [];
+    try { assistantHistory = JSON.parse(sessionStorage.getItem(assistantHistoryKey) || '[]'); } catch { assistantHistory = []; }
+    const pageTrailKey = 'packguard-page-trail';
+    let pageTrail = [];
+    try { pageTrail = JSON.parse(sessionStorage.getItem(pageTrailKey) || '[]'); } catch { pageTrail = []; }
+    const pageEntry = {path: window.location.pathname, title: document.title};
+    const recordPathMatch = window.location.pathname.match(/\/(?:v1\/)?records\/([^/]+)/);
+    const pageContext = {
+      current_page: pageEntry,
+      recent_pages: pageTrail,
+      record_id: recordPathMatch?.[1] || '',
+      product_id: document.querySelector('input[name="selected_product_id"]')?.value || '',
+      source_prep_record_id: document.querySelector('input[name="source_prep_record_id"]')?.value || new URLSearchParams(window.location.search).get('prep_record_id') || '',
+    };
+    if (pageTrail.at(-1)?.path !== pageEntry.path) pageTrail.push(pageEntry);
+    pageTrail = pageTrail.slice(-8);
+    try { sessionStorage.setItem(pageTrailKey, JSON.stringify(pageTrail)); } catch {}
+    function toggleAssistant(open) {
+      assistantPanel.hidden = !open;
+      assistantToggle.setAttribute('aria-expanded', String(open));
+      if (open) assistantInput.focus();
+    }
+    function appendAssistantMessage(role, text) {
+      const message = document.createElement('div');
+      message.className = `assistant-message ${role === 'user' ? 'assistant-message-user' : 'assistant-message-bot'}`;
+      const label = document.createElement('span');
+      label.className = 'assistant-message-label';
+      label.textContent = role === 'user' ? 'You' : 'PackGuard assistant';
+      const body = document.createElement('p');
+      body.textContent = text;
+      message.append(label, body);
+      assistantChat.append(message);
+      assistantChat.scrollTop = assistantChat.scrollHeight;
+      return body;
+    }
+    for (const message of assistantHistory) {
+      if (message && ['user', 'assistant'].includes(message.role) && typeof message.content === 'string') {
+        appendAssistantMessage(message.role, message.content);
+      }
+    }
+    function readSafePageForm() {
+      const form = document.querySelector('.capture-layout');
+      if (!form) return {};
+      const allowedNames = ['product_lookup', 'selected_product_id', 'source_prep_record_id', 'order_id', 'unit_id', 'order_lines', 'observed_in_box', 'channel'];
+      return Object.fromEntries(allowedNames.flatMap((name) => {
+        const field = form.elements.namedItem(name);
+        return field && typeof field.value === 'string' && field.value.trim()
+          ? [[name, field.value.trim().slice(0, 500)]] : [];
+      }));
+    }
+    assistantToggle?.addEventListener('click', () => toggleAssistant(assistantPanel.hidden));
+    assistantClose?.addEventListener('click', () => toggleAssistant(false));
+    document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !assistantPanel.hidden) toggleAssistant(false); });
+    document.querySelectorAll('[data-global-question]').forEach((button) => button.addEventListener('click', () => {
+      assistantInput.value = button.dataset.globalQuestion;
+      assistantForm.requestSubmit();
+    }));
+    assistantForm?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const question = assistantInput.value.trim();
+      if (!question || assistantSend.disabled) return;
+      assistantInput.value = '';
+      appendAssistantMessage('user', question);
+      const previousHistory = assistantHistory.slice(-8);
+      assistantHistory.push({role: 'user', content: question});
+      assistantHistory = assistantHistory.slice(-8);
+      try { sessionStorage.setItem(assistantHistoryKey, JSON.stringify(assistantHistory)); } catch {}
+      const pending = appendAssistantMessage('assistant', 'Thinking...');
+      assistantSend.disabled = true;
+      try {
+        const response = await fetch('{{ url_for("assistant_api") }}', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', 'X-CSRFToken': assistantForm.elements.csrf_token.value},
+          body: JSON.stringify({question, history: previousHistory, page_context: {...pageContext, form_fields: readSafePageForm()}})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'The assistant could not answer just now.');
+        pending.textContent = data.answer || 'I could not produce an answer just now.';
+        assistantHistory.push({role: 'assistant', content: pending.textContent});
+        assistantHistory = assistantHistory.slice(-8);
+        try { sessionStorage.setItem(assistantHistoryKey, JSON.stringify(assistantHistory)); } catch {}
+      } catch (error) {
+        pending.textContent = error.message || 'I could not reach the assistant. Please try again.';
+      } finally {
+        assistantSend.disabled = false;
+        assistantInput.focus();
+      }
     });
   </script>
 </body>

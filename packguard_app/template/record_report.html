@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <title>{{ record.record_id }} · Pack evidence report</title>
 <style>
-body{font:14px Arial,sans-serif;color:#172a32;max-width:900px;margin:40px auto;padding:0 24px}h1{font-size:32px}h2{margin-top:28px;border-bottom:2px solid #e993ab;padding-bottom:8px}dl{display:grid;grid-template-columns:190px 1fr;gap:10px}dt{font-weight:700;color:#53656a}dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}th,td{padding:8px;border:1px solid #dce5df;text-align:left}th{background:#f6dfae}.event{padding:10px 0;border-bottom:1px solid #dce5df}.no-print{position:fixed;right:20px;top:20px;padding:10px 14px;border:0;border-radius:7px;background:#e993ab;color:#000;font-weight:bold}@media print{body{margin:0}.no-print{display:none}}
+body{font:14px Arial,sans-serif;color:#000;max-width:900px;margin:40px auto;padding:0 24px}#packguard-app *{color:#000!important}h1{font-size:32px}h2{margin-top:28px;border-bottom:2px solid #e993ab;padding-bottom:8px}dl{display:grid;grid-template-columns:190px 1fr;gap:10px}dt{font-weight:700;color:#000}dd{margin:0;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}th,td{padding:8px;border:1px solid #dce5df;text-align:left}th{background:#f6dfae}.event{padding:10px 0;border-bottom:1px solid #dce5df}.no-print{position:fixed;right:20px;top:20px;padding:10px 14px;border:0;border-radius:7px;background:#e993ab;color:#000;font-weight:bold}@media print{body{margin:0}.no-print{display:none}}
 </style>
 </head>
-<body>
+<body id="packguard-app">
 <button class="no-print" onclick="window.print()">Print / Save PDF</button>
 <h1>PackGuard outbound evidence report</h1>
 <p>Open-box verification before sealing an outbound order</p>

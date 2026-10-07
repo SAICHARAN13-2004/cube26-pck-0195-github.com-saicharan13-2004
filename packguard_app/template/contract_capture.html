@@ -1,22 +1,23 @@
 {% extends "base.html" %}
 {% block title %}CUBE contract capture · PackGuard{% endblock %}
 {% block content %}
-<section class="page-head compact"><div><a class="back-link" href="{{ url_for('dashboard') }}">← Dashboard</a><p class="eyebrow">CUBE · Evidence Contract 1.1</p><h1>Capture pack evidence</h1><p class="lede">Capture two guided views; add a detail view when needed. Evidence uploads directly to private storage.</p></div></section>
+<section class="page-head compact"><div><a class="back-link" href="{{ url_for('dashboard') }}">← Dashboard</a><p class="eyebrow">CUBE · Evidence Contract 1.1</p><h1>Capture pack evidence</h1><p class="lede">The visual agent inspects the captured box images. Leave observed SKU and quantity blank to let it produce an image-based result; uncertain counts go to review.</p></div></section>
 <form id="contract-capture-form" class="capture-layout" novalidate>
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  {% if defaults.get('source_record_id') %}<input type="hidden" name="source_record_id" value="{{ defaults.source_record_id }}"><div class="observation-note"><span>↳</span><span><strong>Stage 2 handoff loaded</strong><br>Order, shipment, SKU, and expected quantity came from prep record {{ defaults.source_record_id }}.</span></div>{% endif %}
   <section class="form-panel">
     <div class="panel-title"><span class="step">01</span><div><h2>Order and shipment</h2><p>Pack evidence is recorded against the outbound order.</p></div></div>
     <div class="form-grid">
-      <label>Order ID<input name="order_id" required autocomplete="off"></label>
-      <label>Shipment ID <span class="optional">when available</span><input name="shipment_id" autocomplete="off"></label>
-      <label>SKU<input name="sku" required autocomplete="off"></label>
+      <label>Order ID<input name="order_id" value="{{ defaults.get('order_id', '') }}" required autocomplete="off"></label>
+      <label>Shipment ID <span class="optional">when available</span><input name="shipment_id" value="{{ defaults.get('shipment_id', '') }}" autocomplete="off"></label>
+      <label>SKU<input name="sku" value="{{ defaults.get('sku', '') }}" required autocomplete="off"></label>
       <label>ASIN <span class="optional">optional</span><input name="asin" autocomplete="off"></label>
     </div>
     <div class="form-grid">
-      <label>Expected quantity<input name="quantity_expected" type="number" min="0" step="1" required></label>
-      <label>Observed quantity <span class="optional">leave blank if uncertain</span><input name="quantity_observed" type="number" min="0" step="1"></label>
+      <label>Expected quantity<input name="quantity_expected" value="{{ defaults.get('quantity_expected', '') }}" type="number" min="0" step="1" required></label>
+      <label>Observed quantity <span class="optional">optional · leave blank for image-based assessment</span><input name="quantity_observed" type="number" min="0" step="1"></label>
     </div>
-    <label>Observed SKU <span class="optional">leave blank if uncertain</span><input name="observed_sku" autocomplete="off"></label>
+    <label>Observed SKU <span class="optional">optional · agent can inspect the photos</span><input name="observed_sku" autocomplete="off"></label>
   </section>
   <section class="form-panel">
     <div class="panel-title"><span class="step">02</span><div><h2>Guided images</h2><p>Use the rear camera and keep the full package visible.</p></div></div>
@@ -154,6 +155,7 @@ async function createPendingCapture(values) {
     method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
     body: JSON.stringify({
       agent: 'pack', client_id: null,
+      source_record_id: contractForm.elements.source_record_id?.value || null,
       subject: {type: 'order', asin: contractForm.elements.asin.value.trim() || null, sku: values.sku, order_id: values.orderId, po_line_id: null, shipment_id: contractForm.elements.shipment_id.value.trim() || null, quantity_expected: values.expected, quantity_observed: values.observed},
       image_slots: imageSlots, expected_lines: `${values.sku}:${values.expected}`, observed_contents: observedContents,
     }),

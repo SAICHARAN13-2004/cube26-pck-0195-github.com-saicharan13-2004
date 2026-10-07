@@ -119,21 +119,28 @@ def save_product(product: dict[str, Any]) -> None:
 			"""
 			INSERT INTO products (
 				product_id, org_id, organization_id, sku, product_name, brand, external_id,
-				barcode, attributes_json, reference_image_ref, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				barcode, attributes_json, reference_image_ref, supplier_name, origin_address,
+				ordered_for, delivery_address, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (org_id, sku) DO UPDATE SET
 				product_name = excluded.product_name,
 				brand = excluded.brand,
 				external_id = excluded.external_id,
 				barcode = excluded.barcode,
 				attributes_json = excluded.attributes_json,
-				reference_image_ref = COALESCE(excluded.reference_image_ref, products.reference_image_ref)
+				reference_image_ref = COALESCE(excluded.reference_image_ref, products.reference_image_ref),
+				supplier_name = COALESCE(excluded.supplier_name, products.supplier_name),
+				origin_address = COALESCE(excluded.origin_address, products.origin_address),
+				ordered_for = COALESCE(excluded.ordered_for, products.ordered_for),
+				delivery_address = COALESCE(excluded.delivery_address, products.delivery_address)
 			""",
 			(
 				product["product_id"], product["org_id"], product["org_id"], product["sku"],
 				product["product_name"], product.get("brand"), product.get("external_id"),
 				product.get("barcode"), json.dumps(product.get("attributes", {})),
-				product.get("reference_image_ref"), product["created_at"],
+				product.get("reference_image_ref"), product.get("supplier_name"),
+				product.get("origin_address"), product.get("ordered_for"),
+				product.get("delivery_address"), product["created_at"],
 			),
 		)
 
@@ -481,6 +488,30 @@ def get_contract_record(record_id: str, organization_key: str | None = None, *, 
 		return _contract_record(row, connection) if row else None
 
 
+def save_contract_record(record: dict[str, Any], organization_key: str) -> str:
+	"""Persist an immutable external CUBE record, accepting exact retries."""
+	from contract import organization_uuid
+
+	organization_id = organization_uuid(organization_key)
+	record_json = json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+	with connect(organization_key) as connection:
+		cursor = connection.execute(
+			"""INSERT INTO contract_records (record_id, organization_id, agent, captured_at, status, record_json)
+			VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (record_id) DO NOTHING""",
+			(
+				record["record_id"], organization_id, record["agent"],
+				record["captured_at"], record["status"], record_json,
+			),
+		)
+		row = connection.execute(
+			"SELECT record_json FROM contract_records WHERE record_id = ? AND organization_id = ?",
+			(record["record_id"], organization_id),
+		).fetchone()
+		if not row or json.loads(row["record_json"]) != record:
+			return "conflict"
+		return "created" if cursor.rowcount == 1 else "duplicate"
+
+
 def list_contract_records(
 	organization_key: str,
 	*,
@@ -538,3 +569,116 @@ def append_contract_override(record_id: str, organization_key: str, override: di
 			),
 		)
 	return True
+
+
+def create_agent_transfer(transfer: dict[str, Any]) -> None:
+	from contract import organization_uuid
+
+	org_id = transfer["org_id"]
+	organization_id = organization_uuid(org_id)
+	with connect(org_id) as connection:
+		connection.execute(
+			"""INSERT INTO agent_transfers (
+				transfer_id, org_id, organization_id, product_sku, product_name,
+				quantity, source_point, destination_point, scenario, status,
+				verdict, evidence_hash, summary, created_at, completed_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+			(
+				transfer["transfer_id"], org_id, organization_id, transfer["product_sku"],
+				transfer["product_name"], transfer["quantity"], transfer["source_point"],
+				transfer["destination_point"], transfer.get("scenario", "normal"),
+				transfer["status"], transfer["verdict"], transfer.get("evidence_hash"),
+				transfer.get("summary"), transfer["created_at"], transfer.get("completed_at"),
+			),
+		)
+
+
+def update_agent_transfer(
+	transfer_id: str,
+	org_id: str,
+	*,
+	status: str,
+	verdict: str,
+	evidence_hash: str | None = None,
+	summary: str | None = None,
+	completed_at: str | None = None,
+) -> None:
+	from contract import organization_uuid
+
+	organization_id = organization_uuid(org_id)
+	with connect(org_id) as connection:
+		connection.execute(
+			"""UPDATE agent_transfers SET
+				status = ?, verdict = ?, evidence_hash = COALESCE(?, evidence_hash),
+				summary = COALESCE(?, summary), completed_at = COALESCE(?, completed_at)
+			WHERE transfer_id = ? AND (org_id = ? OR organization_id = ?)""",
+			(status, verdict, evidence_hash, summary, completed_at, transfer_id, org_id, organization_id),
+		)
+
+
+def get_agent_transfer(transfer_id: str, org_id: str) -> dict[str, Any] | None:
+	from contract import organization_uuid
+
+	organization_id = organization_uuid(org_id)
+	with connect(org_id) as connection:
+		row = connection.execute(
+			"SELECT * FROM agent_transfers WHERE transfer_id = ? AND (org_id = ? OR organization_id = ?)",
+			(transfer_id, org_id, organization_id),
+		).fetchone()
+	return dict(row) if row else None
+
+
+def list_agent_transfers(org_id: str, limit: int = 50) -> list[dict[str, Any]]:
+	from contract import organization_uuid
+
+	organization_id = organization_uuid(org_id)
+	with connect(org_id) as connection:
+		rows = connection.execute(
+			"SELECT * FROM agent_transfers WHERE org_id = ? OR organization_id = ? ORDER BY created_at DESC LIMIT ?",
+			(org_id, organization_id, limit),
+		).fetchall()
+	return [dict(row) for row in rows]
+
+
+def save_agent_message(message: dict[str, Any]) -> None:
+	from contract import organization_uuid
+
+	org_id = message["org_id"]
+	organization_id = organization_uuid(org_id)
+	with connect(org_id) as connection:
+		connection.execute(
+			"""INSERT INTO agent_messages (
+				message_id, transfer_id, org_id, organization_id, from_agent,
+				to_agent, step_number, message_type, content, payload_json, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+			(
+				message["message_id"], message["transfer_id"], org_id, organization_id,
+				message["from_agent"], message["to_agent"], message["step_number"],
+				message["message_type"], message["content"],
+				json.dumps(message.get("payload", {})), message["created_at"],
+			),
+		)
+
+
+def list_agent_messages(transfer_id: str, org_id: str) -> list[dict[str, Any]]:
+	from contract import organization_uuid
+
+	organization_id = organization_uuid(org_id)
+	with connect(org_id) as connection:
+		rows = connection.execute(
+			"SELECT * FROM agent_messages WHERE transfer_id = ? AND (org_id = ? OR organization_id = ?) ORDER BY step_number ASC, created_at ASC",
+			(transfer_id, org_id, organization_id),
+		).fetchall()
+	result = []
+	for row in rows:
+		item = dict(row)
+		if "payload_json" in item and item["payload_json"]:
+			try:
+				item["payload"] = json.loads(item["payload_json"])
+			except Exception:
+				item["payload"] = {}
+		else:
+			item["payload"] = {}
+		result.append(item)
+	return result
+

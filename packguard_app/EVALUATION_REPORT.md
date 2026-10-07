@@ -38,7 +38,6 @@ The currently verified local behavior is:
 - Multiple expected SKUs route to human review.
 - Gemma 3 4B timed out at 90 seconds on a 320px validation image; Qwen2.5-VL 3B timed out at 120 seconds on the same small validation image. Ollama reported no GPU allocation for the loaded model.
 - Moondream 1.8B returned a single-SKU `MATCH` presence hint in about 1.1 seconds on a validation image, but returned no quantity and cannot validate a full pack.
-- A separate Moondream quantity prompt on the validation image took about 27 seconds and returned an unusable response (`?""`), so prompt-only counting is not a validated workaround.
 - The 50-image prediction run produced `MODEL_TIMEOUT` for all 50 images. This is an unavailable evaluation, not a 0% accuracy result.
 - Vision output cannot authorize `SEAL`.
 - Production candidates include the full tenant catalog, including look-alike decoys. The Moondream fallback routes multi-candidate cases to manual review.

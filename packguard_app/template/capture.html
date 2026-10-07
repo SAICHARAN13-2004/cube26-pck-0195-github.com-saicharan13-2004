@@ -1,94 +1,152 @@
 {% extends "base.html" %}
-{% block title %}New check · PackGuard{% endblock %}
+{% block title %}New pack check · PackGuard{% endblock %}
 {% block content %}
-<section class="page-head compact"><div><a class="back-link" href="{{ url_for('dashboard') }}">← Pack log</a><p class="eyebrow">📦 Outbound pre-seal verification</p><h1>Verify open package</h1><p class="lede">Compare the open box with its outbound order before it is sealed.</p></div></section>
-<section class="demo-presets"><div><p class="eyebrow">Competition demo</p><strong>Load a scenario</strong><span>Pre-fill the workflow in one click.</span></div><button class="button button-secondary demo-preset" type="button" data-preset="pass">Correct package</button><button class="button button-secondary demo-preset" type="button" data-preset="mismatch">Mismatch</button><button class="button button-secondary demo-preset" type="button" data-preset="review">Needs review</button><a class="button button-primary" href="{{ url_for('contract_capture_page') }}">CUBE contract capture</a></section>
-<form class="capture-layout" method="post" enctype="multipart/form-data">
+<section class="page-head compact">
+  <div>
+    <p class="eyebrow">Stage 2 → Stage 3 · {{ active_org }}</p>
+    <h1>New pack check</h1>
+    <p class="lede">Enter a product name or ID, capture the open box, and the agent will assess the image.</p>
+  </div>
+</section>
+
+{% if prep_workflow and not defaults.get('source_prep_record_id') %}
+<details class="prep-inbox">
+  <summary>Incoming prep handoffs <span>{{ prep_workflow|length }}</span></summary>
+  <div class="prep-inbox-list">
+    {% for item in prep_workflow %}
+      <article class="prep-inbox-row">
+        <div><strong>{{ item.product_name }}</strong><small>{{ item.sku }} · {{ item.quantity_expected if item.quantity_expected is not none else 'quantity missing' }} expected</small></div>
+        <div><strong>{{ item.order_id or 'Order not supplied' }}</strong><small>{{ item.record_id }}{% if item.shipment_id %} · {{ item.shipment_id }}{% endif %}</small></div>
+        <div class="prep-inbox-route"><small>From {{ item.logistics.get('origin_address') or 'address not recorded' }}</small><small>To {{ item.logistics.get('delivery_address') or 'address not recorded' }}</small></div>
+        {% if item.capture_url %}<a class="button button-secondary" href="{{ item.capture_url }}">Use handoff</a>{% else %}<span class="prep-inbox-hold">Waiting for complete prep data</span>{% endif %}
+      </article>
+    {% endfor %}
+  </div>
+</details>
+{% endif %}
+
+<form id="new-pack-check" class="new-pack-check" method="post" enctype="multipart/form-data">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  {% if defaults.get('parent_record_id') %}<input type="hidden" name="parent_record_id" value="{{ defaults.parent_record_id }}">{% endif %}
-  <section class="form-panel"><div class="panel-title"><span class="step">01</span><div><h2>🧾 Outbound order context</h2><p>Identify the order and packing unit before sealing.</p></div></div>
-    <div class="form-grid"><label>Packing unit / carton ID<input name="unit_id" value="{{ defaults.get('unit_id', '') }}" placeholder="UNIT-0101" required></label><label>Outbound order ID<input name="order_id" value="{{ defaults.get('order_id', '') }}" placeholder="ORD-50101" required></label><label>Packing operator<input name="operator_id" value="{{ defaults.get('operator_id', '') }}" placeholder="operator name" required></label><label>Packing channel<select name="channel"><option value="amazon_mfn"{% if defaults.get('channel', 'amazon_mfn') == 'amazon_mfn' %} selected{% endif %}>Merchant fulfilled</option><option value="3pl_packing">3PL packing</option><option value="internal_transfer">Internal transfer</option></select></label></div>
-    <p class="field-hint">This local app does not retrieve order contents from the Order ID. Enter the expected lines from your authoritative order system; PackGuard compares them with the observed lines you enter.</p>
-    <div class="form-grid"><label>Attempt<select name="attempt_type"><option value="initial"{% if defaults.get('attempt_type') == 'initial' %} selected{% endif %}>Initial capture</option><option value="recapture"{% if defaults.get('attempt_type') == 'recapture' %} selected{% endif %}>Recapture</option></select></label><label>Recapture reason <span class="optional">required for recapture</span><input name="recapture_reason" value="{{ defaults.get('recapture_reason', '') }}" placeholder="Poor lighting, blocked item, or blurry image"></label></div>
+  <input type="hidden" name="selected_product_id" value="{{ defaults.get('selected_product_id', '') }}">
+  <input type="hidden" name="order_lines" value="{{ defaults.get('order_lines', '') }}">
+  <input type="hidden" name="observed_in_box" value="">
+  <input type="hidden" name="unit_id" value="{{ defaults.get('unit_id', '') }}">
+  <input type="hidden" name="order_id" value="{{ defaults.get('order_id', '') }}">
+  <input type="hidden" name="operator_id" value="{{ defaults.get('operator_id', username) }}">
+  <input type="hidden" name="channel" value="{{ defaults.get('channel', 'amazon_mfn') }}">
+  <input type="hidden" name="attempt_type" value="{{ defaults.get('attempt_type', 'initial') }}">
+  <input type="hidden" name="recapture_reason" value="{{ defaults.get('recapture_reason', '') }}">
+  <input type="hidden" name="supplier_name" value="{{ defaults.get('supplier_name', '') }}">
+  <input type="hidden" name="origin_address" value="{{ defaults.get('origin_address', '') }}">
+  <input type="hidden" name="delivery_address" value="{{ defaults.get('delivery_address', '') }}">
+  <input type="hidden" name="operator_verdict" value="">
+  <input type="hidden" name="override_reason" value="">
+  <input type="hidden" name="parent_record_id" value="{{ defaults.get('parent_record_id', '') }}">
+  <input type="hidden" name="source_prep_record_id" value="{{ defaults.get('source_prep_record_id', '') }}">
+
+  <section class="product-lookup-panel">
+    <label for="product-lookup">Product name or Product ID</label>
+    <input id="product-lookup" value="{{ defaults.get('product_lookup', '') }}" placeholder="Search product name, Product ID, SKU, or barcode" autocomplete="off" required>
+    <div id="product-lookup-results" class="product-lookup-results" role="listbox" hidden></div>
+    <section id="selected-product-summary" class="selected-product-summary" aria-live="polite" {% if not defaults.get('selected_product_id') %}hidden{% endif %}>
+      <header><div><strong id="selected-product-name">{{ defaults.get('product_lookup', '') }}</strong><small id="selected-product-sku">{{ defaults.get('order_lines', '').split(':')[0] if defaults.get('order_lines') else '' }}</small></div><span id="selected-product-id">{{ defaults.get('selected_product_id', '') }}</span></header>
+      <dl>
+        <div><dt>Brand / variant</dt><dd id="selected-product-attributes">Not recorded</dd></div>
+        <div><dt>Supplier</dt><dd id="selected-product-supplier">{{ defaults.get('supplier_name') or 'Not recorded' }}</dd></div>
+        <div><dt>From / arrival</dt><dd id="selected-product-origin">{{ defaults.get('origin_address') or 'Not recorded' }}</dd></div>
+        <div><dt>Ordered for</dt><dd id="selected-product-recipient">{{ defaults.get('ordered_for') or 'Not recorded' }}</dd></div>
+        <div><dt>Destination</dt><dd id="selected-product-destination">{{ defaults.get('delivery_address') or 'Not recorded' }}</dd></div>
+        <div><dt>Expected quantity</dt><dd id="selected-product-quantity">{{ defaults.get('order_lines', '').rsplit(':', 1)[-1] if defaults.get('order_lines') else '1 (product-only default)' }}</dd></div>
+      </dl>
+    </section>
+    {% if defaults.get('source_prep_record_id') %}<p class="prep-source-note">Loaded from Stage-2 prep record {{ defaults.source_prep_record_id }}. Order, SKU, quantity, and route are locked to that handoff.</p>{% endif %}
   </section>
-  <section class="form-panel"><div class="panel-title"><span class="step">02</span><div><h2>📦 Order contents before sealing</h2><p>Use <code>SKU:quantity</code>; separate multiple SKUs with semicolons.</p></div></div>
-    {% if products %}<fieldset class="catalog-picker"><legend>Choose expected products from your catalog</legend><div class="catalog-picker-list">{% for product in products %}<label class="catalog-choice"><input type="checkbox" class="catalog-select" data-sku="{{ product.sku }}"><span><strong>{{ product.product_name }}</strong><small>{{ product.sku }}{% if product.attributes %} · {{ product.attributes|tojson }}{% endif %}</small></span><input class="catalog-quantity" type="number" min="1" value="1" aria-label="Quantity for {{ product.sku }}"></label>{% endfor %}</div></fieldset>{% else %}<div class="observation-note"><span>!</span><span><strong>No catalog products yet</strong><br><a href="{{ url_for('product_catalog') }}">Add products to your catalog</a>, or enter expected SKUs manually below.</span></div>{% endif %}
-    <label>Expected outbound order lines<textarea name="order_lines" rows="3" placeholder="SKU-CABLE-USBC:1;SKU-BOTTLE-750:1" required>{{ defaults.get('order_lines', '') }}</textarea></label>
-    <label>Observed items in open box<textarea name="observed_in_box" rows="3" placeholder="SKU-CABLE-USBC:1;SKU-BOTTLE-750:1"></textarea></label>
-    <div class="observation-note"><span>!</span><span><strong>Agent workflow</strong><br>PackGuard compares the order with your observation and can use a local vision model to suggest visible products. Vision suggestions remain uncalibrated and require human confirmation.</span></div>
-    <div class="camera-guidance"><strong>Before capture</strong><span>Keep the box open, show the full box, separate overlapping items, and make labels visible where possible.</span></div>
-    <div class="camera-controls"><button id="camera-start" class="button button-secondary" type="button">📷 Open camera</button><span>Keep the box open and all items visible.</span></div><div id="camera-panel" class="camera-panel" hidden><video id="camera-video" autoplay muted playsinline></video><div><button id="camera-capture" class="button button-primary" type="button">Take photo</button><button id="camera-stop" class="button button-secondary" type="button">Close camera</button></div></div><p id="camera-error" class="camera-error" role="status" hidden></p>
-    <label>Open-box photo <span class="optional">optional · JPG, PNG, WEBP</span><input id="photo-input" name="photo" type="file" accept="image/jpeg,image/png,image/webp" capture="environment"><small class="field-hint">Use Open camera or choose an existing image file.</small></label><img id="photo-preview" class="capture-preview" alt="Open-box photo preview" hidden>
-    <label>Packing video <span class="optional">optional · MP4, WEBM, MOV</span><input name="packing_video" type="file" accept="video/mp4,video/webm,video/quicktime"><small class="field-hint">The packing video is stored as tenant-scoped evidence.</small></label>
-    <label>Photo reference <span class="optional">optional</span><input name="photo_ref" placeholder="fixtures/pack/UNIT-0101_open_box.jpg"></label>
-  </section>
-  <section class="form-panel"><div class="panel-title"><span class="step">03</span><div><h2>👤 Operator context</h2><p>Useful for comparing human and agent decisions later.</p></div></div>
-    <label>Operator verdict <span class="optional">optional</span><select name="operator_verdict"><option value="">Not recorded</option><option value="seal">Seal</option><option value="stop_and_fix">Stop and fix</option></select></label>
-    <label>Override reason <span class="optional">required when disagreeing with the deterministic result in production</span><textarea name="override_reason" rows="2" placeholder="Explain why the operator decision differs"></textarea></label>
-    <button class="button button-primary button-wide" type="submit">Run pack check <span>🚀</span></button>
+
+  <section class="image-check-panel">
+    <div><p class="eyebrow">Image evidence</p><h2>Open-box photo</h2><p>Keep all items visible. The agent starts automatically after capture or file selection.</p></div>
+    <div class="camera-controls"><button id="camera-start" class="button button-secondary" type="button">Open camera</button><button id="camera-stop" class="button button-secondary" type="button" disabled>Close camera</button></div>
+    <video id="camera-video" autoplay muted playsinline hidden></video>
+    <div id="camera-panel" class="camera-panel" hidden><button id="camera-capture" class="button button-primary" type="button">Capture and run check</button></div>
+    <p id="camera-error" class="camera-error" role="status" hidden></p>
+    <label class="photo-file-label">Or choose an image<input id="photo-input" name="photo" type="file" accept="image/jpeg,image/png,image/webp" capture="environment"></label>
+    <img id="photo-preview" class="capture-preview" alt="Open-box photo preview" hidden>
+    <p id="agent-photo-error" class="camera-error" role="alert" hidden></p>
+    <p id="autonomous-check-status" class="autonomous-check-status" role="status" aria-live="polite">Choose a product, then capture the open box.</p>
   </section>
 </form>
+
+<style>
+.prep-inbox{margin:0 0 18px;padding:14px 16px;border:1px solid rgba(41,49,58,.14);border-radius:7px;background:#fff}
+.prep-inbox summary{display:flex;justify-content:space-between;cursor:pointer;font-weight:800}.prep-inbox summary span{color:#147d78}.prep-inbox-list{display:grid;margin-top:8px}.prep-inbox-row{display:grid;grid-template-columns:1fr 1fr 1.2fr auto;align-items:center;gap:12px;padding:10px 0;border-top:1px solid #d7e3e1}.prep-inbox-row strong,.prep-inbox-row small{display:block;overflow-wrap:anywhere}.prep-inbox-row small{margin-top:3px;color:#5c6c70;font-size:12px}.prep-inbox-hold{color:#795d20;font-size:12px}
+.new-pack-check{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px;align-items:start}.product-lookup-panel,.image-check-panel{position:relative;padding:20px;border:1px solid #d7e3e1;border-radius:8px;background:#fff}.product-lookup-panel>label,.photo-file-label{display:grid;gap:7px;font-weight:800}.product-lookup-panel>input,.photo-file-label input{width:100%;padding:13px;border:1px solid #bdcfcd;border-radius:6px;font:inherit}.product-lookup-results{position:absolute;z-index:10;left:20px;right:20px;display:grid;max-height:240px;overflow:auto;border:1px solid #bdcfcd;border-radius:6px;background:#fff;box-shadow:0 8px 20px rgba(30,50,50,.12)}.product-lookup-option{padding:10px 12px;border:0;border-bottom:1px solid #e5eceb;background:#fff;text-align:left;cursor:pointer}.product-lookup-option:hover{background:#eaf4f2}.product-lookup-empty{padding:12px;color:#5c6c70}
+.selected-product-summary{margin-top:16px;padding:14px;border-left:3px solid #147d78;background:#f2f7f6}.selected-product-summary[hidden]{display:none}.selected-product-summary header{display:flex;justify-content:space-between;gap:10px;margin-bottom:10px}.selected-product-summary header strong,.selected-product-summary header small{display:block;overflow-wrap:anywhere}.selected-product-summary header small{margin-top:3px;color:#5c6c70}.selected-product-summary dl{display:grid;gap:8px;margin:0}.selected-product-summary dl div{display:grid;grid-template-columns:130px 1fr;gap:8px}.selected-product-summary dt{color:#5c6c70;font-size:12px}.selected-product-summary dd{margin:0;overflow-wrap:anywhere}.prep-source-note{margin:12px 0 0;color:#147d78;font-size:12px}
+.image-check-panel h2{margin:0 0 6px}.image-check-panel>div>p:last-child{color:#5c6c70;font-size:13px}.camera-controls{display:flex;gap:8px;margin:16px 0}.camera-controls button:disabled{opacity:.45;cursor:not-allowed}#camera-video{width:100%;max-height:360px;object-fit:contain;background:#17272b;border-radius:6px}.camera-panel{margin-top:10px}.camera-panel[hidden]{display:none}.photo-file-label{margin:14px 0}.capture-preview{display:block;max-width:100%;max-height:300px;object-fit:contain;margin:10px auto}.autonomous-check-status{padding:10px 12px;border-radius:5px;background:#edf5f3;color:#245d58;font-size:13px}.camera-error{color:#9b392a;font-size:13px}
+@media(max-width:760px){.new-pack-check{grid-template-columns:1fr}.prep-inbox-row{grid-template-columns:1fr 1fr}.prep-inbox-route{grid-column:1/-1}.prep-inbox-row .button,.prep-inbox-hold{grid-column:1/-1}.selected-product-summary dl div{grid-template-columns:1fr;gap:2px}}
+</style>
+
 <script>
-const presetValues = {pass: {unit_id: 'UNIT-DEMO-PASS', order_id: 'ORD-DEMO-PASS', order_lines: 'SKU-CABLE-USBC:1', observed_in_box: 'SKU-CABLE-USBC:1', operator_id: 'alpha.operator', operator_verdict: 'seal'}, mismatch: {unit_id: 'UNIT-DEMO-FIX', order_id: 'ORD-DEMO-FIX', order_lines: 'SKU-CABLE-USBC:1', observed_in_box: 'SKU-BOTTLE-750:1', operator_id: 'alpha.operator', operator_verdict: 'stop_and_fix'}, review: {unit_id: 'UNIT-DEMO-REVIEW', order_id: 'ORD-DEMO-REVIEW', order_lines: 'SKU-CABLE-USBC:1', observed_in_box: '', operator_id: 'alpha.operator', operator_verdict: ''}};
-document.querySelectorAll('.demo-preset').forEach((button) => button.addEventListener('click', () => { document.querySelectorAll('.catalog-select').forEach((checkbox) => { checkbox.checked = false; }); const values = presetValues[button.dataset.preset]; Object.entries(values).forEach(([name, value]) => { const field = document.querySelector(`[name="${name}"]`); if (field) field.value = value; }); }));
-const expectedLines = document.querySelector('textarea[name="order_lines"]');
-const catalogChoices = document.querySelectorAll('.catalog-select');
-function updateExpectedLines() {
-  expectedLines.value = Array.from(catalogChoices)
-    .filter((checkbox) => checkbox.checked)
-    .map((checkbox) => `${checkbox.dataset.sku}:${Math.max(1, Number(checkbox.closest('.catalog-choice').querySelector('.catalog-quantity').value) || 1)}`)
-    .join(';');
+const captureForm=document.getElementById('new-pack-check');
+const catalogProducts={{ products|tojson }};
+const productLookup=document.getElementById('product-lookup');
+const resultList=document.getElementById('product-lookup-results');
+const productIdField=captureForm.elements.selected_product_id;
+const expectedLines=captureForm.elements.order_lines;
+const sourcePrepId=captureForm.elements.source_prep_record_id.value;
+const photoInput=document.getElementById('photo-input');
+const photoPreview=document.getElementById('photo-preview');
+const statusText=document.getElementById('autonomous-check-status');
+const photoError=document.getElementById('agent-photo-error');
+const cameraVideo=document.getElementById('camera-video');
+const cameraPanel=document.getElementById('camera-panel');
+let cameraStream=null;
+let checkStarted=false;
+function setProductText(id,value){document.getElementById(id).textContent=value||'Not recorded';}
+function chooseProduct(product){
+  productIdField.value=product.product_id;
+  productLookup.value=product.product_name;
+  document.getElementById('selected-product-summary').hidden=false;
+  setProductText('selected-product-name',product.product_name);
+  setProductText('selected-product-id',product.product_id);
+  setProductText('selected-product-sku',`${product.sku}${product.barcode?` · ${product.barcode}`:''}`);
+  setProductText('selected-product-attributes',[product.brand,JSON.stringify(product.attributes||{})].filter(Boolean).join(' · '));
+  setProductText('selected-product-supplier',product.supplier_name);
+  setProductText('selected-product-origin',product.origin_address);
+  setProductText('selected-product-recipient',product.ordered_for);
+  setProductText('selected-product-destination',product.delivery_address);
+  if(!sourcePrepId) expectedLines.value=`${product.sku}:1`;
+  setProductText('selected-product-quantity',expectedLines.value.split(':').at(-1)||'1');
+  resultList.replaceChildren();resultList.hidden=true;
+  startCheckIfReady();
 }
-catalogChoices.forEach((checkbox) => checkbox.addEventListener('change', updateExpectedLines));
-document.querySelectorAll('.catalog-quantity').forEach((input) => input.addEventListener('input', () => { if (input.closest('.catalog-choice').querySelector('.catalog-select').checked) updateExpectedLines(); }));
-const photoInput = document.getElementById('photo-input');
-const photoPreview = document.getElementById('photo-preview');
-const cameraStart = document.getElementById('camera-start');
-const cameraPanel = document.getElementById('camera-panel');
-const cameraVideo = document.getElementById('camera-video');
-const cameraError = document.getElementById('camera-error');
-let cameraStream;
-function closeCamera() {
-  cameraStream?.getTracks().forEach((track) => track.stop());
-  cameraStream = undefined;
-  cameraVideo.srcObject = null;
-  cameraPanel.hidden = true;
+function renderMatches(query){
+  resultList.replaceChildren();const normalized=query.trim().toLocaleLowerCase();
+  if(normalized.length<2){resultList.hidden=true;return;}
+  const matches=catalogProducts.filter(product=>[product.product_name,product.product_id,product.sku,product.barcode,product.external_id].some(value=>String(value||'').toLocaleLowerCase().includes(normalized))).slice(0,8);
+  for(const product of matches){const option=document.createElement('button');option.type='button';option.className='product-lookup-option';option.textContent=`${product.product_name} · ${product.product_id} · ${product.sku}`;option.addEventListener('click',()=>chooseProduct(product));resultList.append(option);}
+  if(!matches.length){const empty=document.createElement('span');empty.className='product-lookup-empty';empty.textContent='No matching product in this workspace catalog.';resultList.append(empty);}
+  resultList.hidden=false;
 }
-cameraStart.addEventListener('click', async () => {
-  cameraError.hidden = true;
-  if (!navigator.mediaDevices?.getUserMedia) {
-    cameraError.textContent = 'Camera access is unavailable here. Use Choose file instead.';
-    cameraError.hidden = false;
-    return;
-  }
-  try {
-    cameraStream = await navigator.mediaDevices.getUserMedia({video: {facingMode: {ideal: 'environment'}}, audio: false});
-    cameraVideo.srcObject = cameraStream;
-    cameraPanel.hidden = false;
-  } catch {
-    cameraError.textContent = 'Camera permission was denied or no camera was found. Use Choose file instead.';
-    cameraError.hidden = false;
-  }
-});
-document.getElementById('camera-stop').addEventListener('click', closeCamera);
-document.getElementById('camera-capture').addEventListener('click', () => {
-  const canvas = document.createElement('canvas');
-  canvas.width = cameraVideo.videoWidth;
-  canvas.height = cameraVideo.videoHeight;
-  canvas.getContext('2d').drawImage(cameraVideo, 0, 0);
-  canvas.toBlob((blob) => {
-    if (!blob) return;
-    const upload = new DataTransfer();
-    upload.items.add(new File([blob], `pack-${Date.now()}.jpg`, {type: 'image/jpeg'}));
-    photoInput.files = upload.files;
-    photoInput.dispatchEvent(new Event('change', {bubbles: true}));
-    closeCamera();
-  }, 'image/jpeg', .92);
-});
-photoInput.addEventListener('change', () => {
-  const file = photoInput.files[0];
-  photoPreview.hidden = !file;
-  if (file) photoPreview.src = URL.createObjectURL(file);
-});
+productLookup.addEventListener('input',()=>{productIdField.value='';document.getElementById('selected-product-summary').hidden=true;renderMatches(productLookup.value);});
+productLookup.addEventListener('keydown',event=>{if(event.key==='Escape')resultList.hidden=true;});
+const initialProduct=catalogProducts.find(product=>product.product_id===productIdField.value);
+if(initialProduct)chooseProduct(initialProduct);
+function startCheckIfReady(){
+  if(checkStarted||!photoInput.files.length)return;
+  if(!productIdField.value&&!sourcePrepId){photoError.textContent='Select a product before taking its photo.';photoError.hidden=false;return;}
+  if(!expectedLines.value.trim()){photoError.textContent='Expected product data is missing from the catalog or Stage-2 handoff.';photoError.hidden=false;return;}
+  checkStarted=true;photoError.hidden=true;statusText.textContent='Photo received. Agent is checking the package...';
+  cameraStream?.getTracks().forEach(track=>track.stop());cameraStream=null;cameraVideo.srcObject=null;cameraVideo.hidden=true;cameraPanel.hidden=true;
+  window.setTimeout(()=>captureForm.requestSubmit(),50);
+}
+async function openCamera(){
+  try{cameraStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});cameraVideo.srcObject=cameraStream;cameraVideo.hidden=false;cameraPanel.hidden=false;document.getElementById('camera-stop').disabled=false;}
+  catch(error){document.getElementById('camera-error').textContent=`Camera unavailable (${error.name}). Choose an image file instead.`;document.getElementById('camera-error').hidden=false;}
+}
+function closeCamera(){cameraStream?.getTracks().forEach(track=>track.stop());cameraStream=null;cameraVideo.srcObject=null;cameraVideo.hidden=true;cameraPanel.hidden=true;document.getElementById('camera-stop').disabled=true;}
+document.getElementById('camera-start').addEventListener('click',openCamera);
+document.getElementById('camera-stop').addEventListener('click',closeCamera);
+document.getElementById('camera-capture').addEventListener('click',()=>{const canvas=document.createElement('canvas');canvas.width=cameraVideo.videoWidth;canvas.height=cameraVideo.videoHeight;canvas.getContext('2d').drawImage(cameraVideo,0,0);canvas.toBlob(blob=>{if(!blob)return;const upload=new DataTransfer();upload.items.add(new File([blob],`pack-${Date.now()}.jpg`,{type:'image/jpeg'}));photoInput.files=upload.files;photoInput.dispatchEvent(new Event('change',{bubbles:true}));},'image/jpeg',.92);});
+photoInput.addEventListener('change',()=>{const file=photoInput.files[0];if(!file)return;photoPreview.src=URL.createObjectURL(file);photoPreview.hidden=false;startCheckIfReady();});
+captureForm.addEventListener('submit',event=>{if(!photoInput.files.length){event.preventDefault();photoError.textContent='Capture or choose an open-box photo first.';photoError.hidden=false;}});
 </script>
 {% endblock %}

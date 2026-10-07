@@ -229,3 +229,63 @@ def apply_migrations(connection: Any, backend: str) -> None:
 			"INSERT INTO schema_migrations (version, applied_at, organization_id) VALUES (?, ?, '__system__')",
 			(5, datetime.now(timezone.utc).isoformat()),
 		)
+	if 6 not in applied:
+		connection.execute(
+			"""CREATE TABLE IF NOT EXISTS agent_transfers (
+				transfer_id TEXT PRIMARY KEY,
+				org_id TEXT NOT NULL,
+				organization_id TEXT NOT NULL,
+				product_sku TEXT NOT NULL,
+				product_name TEXT NOT NULL,
+				quantity INTEGER NOT NULL,
+				source_point TEXT NOT NULL,
+				destination_point TEXT NOT NULL,
+				scenario TEXT NOT NULL DEFAULT 'normal',
+				status TEXT NOT NULL,
+				verdict TEXT NOT NULL,
+				evidence_hash TEXT,
+				summary TEXT,
+				created_at TEXT NOT NULL,
+				completed_at TEXT
+			)"""
+		)
+		connection.execute(
+			"""CREATE TABLE IF NOT EXISTS agent_messages (
+				message_id TEXT PRIMARY KEY,
+				transfer_id TEXT NOT NULL,
+				org_id TEXT NOT NULL,
+				organization_id TEXT NOT NULL,
+				from_agent TEXT NOT NULL,
+				to_agent TEXT NOT NULL,
+				step_number INTEGER NOT NULL,
+				message_type TEXT NOT NULL,
+				content TEXT NOT NULL,
+				payload_json TEXT NOT NULL DEFAULT '{}',
+				created_at TEXT NOT NULL
+			)"""
+		)
+		connection.execute("CREATE INDEX IF NOT EXISTS idx_agent_transfers_org ON agent_transfers (organization_id, created_at DESC)")
+		connection.execute("CREATE INDEX IF NOT EXISTS idx_agent_messages_transfer ON agent_messages (organization_id, transfer_id, step_number ASC)")
+		if backend == "postgresql":
+			for table in ("agent_transfers", "agent_messages"):
+				setting = "app.organization_key"
+				expression = f"organization_id = current_setting('{setting}', true)"
+				connection.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+				connection.execute(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY")
+				connection.execute(f"DROP POLICY IF EXISTS tenant_scope ON {table}")
+				connection.execute(
+					f"CREATE POLICY tenant_scope ON {table} USING ({expression}) WITH CHECK (organization_id = current_setting('{setting}', true))"
+				)
+		connection.execute(
+			"INSERT INTO schema_migrations (version, applied_at, organization_id) VALUES (?, ?, '__system__')",
+			(6, datetime.now(timezone.utc).isoformat()),
+		)
+	if 7 not in applied:
+		product_columns = _columns(connection, backend, "products")
+		for name in ("supplier_name", "origin_address", "ordered_for", "delivery_address"):
+			if name not in product_columns:
+				connection.execute(f"ALTER TABLE products ADD COLUMN {name} TEXT")
+		connection.execute(
+			"INSERT INTO schema_migrations (version, applied_at, organization_id) VALUES (?, ?, '__system__')",
+			(7, datetime.now(timezone.utc).isoformat()),
+		)
