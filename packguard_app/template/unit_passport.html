@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Unit passport · PackGuard{% endblock %}
+{% block content %}
+<section class="page-head compact">
+  <div><p class="eyebrow">UBE FLOW · EVIDENCE JOURNEY</p><h1>Unit passport</h1><p class="lede">Follow one unit through receiving, its fulfillment route, returns, and any evidence-backed recovery.</p></div>
+</section>
+<section class="form-panel" style="max-width:760px;margin:0 auto 22px;padding:20px;background:#fff;border:1px solid #e2e8f0;border-radius:14px">
+  <form method="get" action="{{ url_for('unit_passport_page') }}" style="display:grid;grid-template-columns:2fr 1fr 1.4fr auto;gap:12px;align-items:end">
+    <label>Order ID<input name="order_id" value="{{ order_id }}" required placeholder="ORD-123" autocomplete="off"></label>
+    <label>Channel<select name="channel"><option value="FBA" {{ 'selected' if channel|upper == 'FBA' }}>FBA</option><option value="MFN" {{ 'selected' if channel|upper == 'MFN' }}>MFN</option><option value="3PL" {{ 'selected' if channel|upper == '3PL' }}>3PL</option></select></label>
+    <label>Unit ID <span style="color:#64748b">(optional)</span><input name="unit_id" value="{{ unit_id }}" placeholder="Auto-detect when unique" autocomplete="off"></label>
+    <button class="button button-primary" type="submit">Open passport</button>
+  </form>
+</section>
+{% if error %}<div class="alert-card" role="alert">{{ error }}</div>{% endif %}
+{% if journey %}
+<section class="dashboard-head" style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;margin-bottom:16px">
+  <div style="display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap"><div><p class="eyebrow">UNIT · {{ journey.fulfillment_channel }}</p><h2 style="margin:0">{{ journey.order_id }}</h2><p class="muted">Unit {{ journey.unit_id or 'not yet identified' }}</p></div><div style="max-width:420px"><strong>Recommended next step</strong><p>{{ journey.next_action.reason }}</p><span class="workflow-state state-{{ 'ready' if journey.next_action.kind in ['operator_action','journey_complete'] else 'hold' }}">{{ journey.next_action.kind|replace('_',' ')|upper }}</span>{% if journey.next_action.agent %}<span class="muted"> · {{ journey.next_action.agent|title }}</span>{% endif %}</div></div>
+</section>
+<section class="workflow-lanes" aria-label="Unit stages">
+  {% for stage in journey.stages %}
+  <article class="workflow-lane">
+    <header class="workflow-lane-header"><span class="workflow-stage-number">{{ '%02d'|format(loop.index) }}</span><div><p class="eyebrow">{{ stage.agent|upper }}</p><h2>{{ stage.label }}</h2></div><span class="workflow-state state-{{ 'ready' if stage.state in ['done','ready','skipped'] else 'hold' }}">{{ stage.state|replace('_',' ')|upper }}</span></header>
+    {% if stage.record_id %}<p class="workflow-lane-description">Evidence record: <code>{{ stage.record_id }}</code></p>{% endif %}
+    {% if stage.decision %}<p class="workflow-lane-description">Recorded decision: {{ stage.decision|replace('_',' ')|upper }}</p>{% endif %}
+    {% if stage.failure_event %}<p class="workflow-hold-note">Latest event: {{ stage.failure_event }}</p>{% endif %}
+  </article>
+  {% endfor %}
+</section>
+<section class="form-panel" style="margin-top:18px;padding:18px;background:#fff;border:1px solid #e2e8f0;border-radius:14px"><h2>Evidence references</h2>{% if journey.evidence_refs %}<ul>{% for ref in journey.evidence_refs %}<li><strong>{{ ref.agent|title }}</strong> · <code>{{ ref.record_id }}</code></li>{% endfor %}</ul>{% else %}<p class="muted">No stage records are linked to this unit yet.</p>{% endif %}</section>
+{% elif not order_id %}<section class="empty-state"><strong>Open a unit passport</strong><p>Enter an order ID to see its records, selected FBA/MFN/3PL route, and next action.</p></section>{% endif %}
+{% endblock %}

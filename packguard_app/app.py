@@ -29,13 +29,14 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from database import APP_DIR, DB_PATH, append_contract_override, clear_login_attempts, complete_contract_capture, connect, create_contract_capture, get_contract_capture, get_contract_record, get_oidc_user, get_product, get_record, get_user, init_db, link_oidc_identity, list_audit_events, list_contract_records, list_products, list_records, list_session_records, list_support_requests, login_blocked_until, record_login_failure, reset_organization_context, save_audit_event, save_contract_record, save_product, save_record, save_support_request, save_user, set_organization_context, update_contract_record, update_workflow_state, user_exists
+from database import APP_DIR, DB_PATH, append_contract_override, clear_login_attempts, complete_contract_capture, connect, create_contract_capture, get_contract_capture, get_contract_record, get_oidc_user, get_product, get_record, get_user, init_db, link_oidc_identity, list_audit_events, list_contract_records, list_products, list_records, list_session_records, list_support_requests, list_unit_events, login_blocked_until, record_login_failure, reset_organization_context, save_audit_event, save_contract_record, save_product, save_record, save_support_request, save_user, set_organization_context, update_contract_record, update_workflow_state, user_exists
 from detector import observe, observe_image
 from evedince import build_evidence
 from evaluation import summarize_records
 from policy import auto_seal_policy, require_operator_confirmation
 from agent import assess_pack, enforce_component_verdict
 from orchestrator import FAILED_VISION_STATUSES, run_pack_agent_workflow
+from unit_journey import build_journey
 from production import readiness_report
 from storage import create_media_storage
 from verifier import diagnose_pack_contents, parse_lines, verify_pack
@@ -85,12 +86,13 @@ OIDC_ENABLED = bool(
 )
 PREP_AGENT_API_TOKEN = os.environ.get("PACKGUARD_PREP_AGENT_TOKEN", "").strip()
 PACK_FEED_AGENT_API_TOKEN = os.environ.get("PACKGUARD_PACK_FEED_TOKEN", "").strip()
+UNIT_EVENT_API_TOKEN = os.environ.get("PACKGUARD_UNIT_EVENT_TOKEN", "").strip()
 AGENT_API_ORG_ID = os.environ.get("PACKGUARD_AGENT_API_ORG_ID", "").strip()
 RETURNS_AGENT_WEBHOOK_URL = os.environ.get("PACKGUARD_RETURNS_AGENT_URL", "").strip()
 RETURNS_AGENT_WEBHOOK_TOKEN = os.environ.get("PACKGUARD_RETURNS_AGENT_TOKEN", "").strip()
-if (PREP_AGENT_API_TOKEN or PACK_FEED_AGENT_API_TOKEN or RETURNS_AGENT_WEBHOOK_URL or RETURNS_AGENT_WEBHOOK_TOKEN) and not AGENT_API_ORG_ID:
+if (PREP_AGENT_API_TOKEN or PACK_FEED_AGENT_API_TOKEN or UNIT_EVENT_API_TOKEN or RETURNS_AGENT_WEBHOOK_URL or RETURNS_AGENT_WEBHOOK_TOKEN) and not AGENT_API_ORG_ID:
 	raise RuntimeError("PACKGUARD_AGENT_API_ORG_ID is required when machine agent tokens are configured")
-if any(token and len(token) < 32 for token in (PREP_AGENT_API_TOKEN, PACK_FEED_AGENT_API_TOKEN, RETURNS_AGENT_WEBHOOK_TOKEN)):
+if any(token and len(token) < 32 for token in (PREP_AGENT_API_TOKEN, PACK_FEED_AGENT_API_TOKEN, UNIT_EVENT_API_TOKEN, RETURNS_AGENT_WEBHOOK_TOKEN)):
 	raise RuntimeError("Machine agent tokens must contain at least 32 characters")
 if bool(RETURNS_AGENT_WEBHOOK_URL) != bool(RETURNS_AGENT_WEBHOOK_TOKEN):
 	raise RuntimeError("PACKGUARD_RETURNS_AGENT_URL and PACKGUARD_RETURNS_AGENT_TOKEN must be configured together")
@@ -1363,6 +1365,116 @@ def agent_hub():
 		),
 		active_org=org_id,
 	)
+
+
+@app.get("/unit-passport")
+@login_required
+def unit_passport_page():
+	order_id = request.args.get("order_id", "").strip()
+	channel = request.args.get("channel", "MFN").strip()
+	unit_id = request.args.get("unit_id", "").strip() or None
+	journey = None
+	error = None
+	if order_id:
+		org_id = current_org()
+		records = []
+		for agent_name in ("receiving", "prep", "pack", "returns"):
+			records.extend(list_contract_records(org_id, since=None, agent=agent_name, cursor=None, limit=100))
+		events = list_unit_events(org_id, order_id=order_id, unit_id=unit_id)
+		for record in records:
+			if (record.get("subject") or {}).get("order_id") == order_id:
+				events.extend(list_audit_events(record["record_id"], org_id))
+		try:
+			journey = build_journey(order_id, channel, records, unit_id=unit_id, events=events)
+		except ValueError as exc:
+			error = str(exc)
+	return render_template("unit_passport.html", order_id=order_id, channel=channel,
+	                       unit_id=unit_id or "", journey=journey, error=error)
+
+
+@app.get("/api/unit-passport")
+@login_required
+def unit_passport_api():
+	order_id = request.args.get("order_id", "").strip()
+	channel = request.args.get("channel", "MFN").strip()
+	unit_id = request.args.get("unit_id", "").strip() or None
+	if not order_id:
+		return jsonify({"error": "order_id is required."}), 400
+	org_id = current_org()
+	records = []
+	for agent_name in ("receiving", "prep", "pack", "returns"):
+		records.extend(list_contract_records(org_id, since=None, agent=agent_name, cursor=None, limit=100))
+	events = list_unit_events(org_id, order_id=order_id, unit_id=unit_id)
+	for record in records:
+		if (record.get("subject") or {}).get("order_id") == order_id:
+			events.extend(list_audit_events(record["record_id"], org_id))
+	try:
+		return jsonify(build_journey(order_id, channel, records, unit_id=unit_id, events=events))
+	except ValueError as exc:
+		return jsonify({"error": str(exc)}), 400
+
+
+def save_unit_event(
+	org_id: str, unit_id: str, order_id: str, event_type: str, reason: str,
+	actor_id: str, details: dict[str, Any] | None = None, event_id: str | None = None,
+) -> None:
+	event_details = {**(details or {}), "unit_id": unit_id, "order_id": order_id}
+	save_audit_event({
+		"event_id": event_id or f"EVT-{uuid4().hex[:16].upper()}",
+		"record_id": f"unit:{unit_id}", "org_id": org_id,
+		"event_type": event_type, "reason": reason, "actor_id": actor_id,
+		"created_at": utc_now(), "details": event_details,
+	})
+
+
+@app.post("/v1/agent/events")
+@csrf.exempt
+def agent_ingest_unit_event():
+	"""Persist a tenant-scoped, idempotent business event for a unit passport."""
+	organization_key, auth_error = agent_api_org(UNIT_EVENT_API_TOKEN)
+	if auth_error:
+		return auth_error
+	body = request.get_json(silent=True)
+	if not isinstance(body, dict):
+		return jsonify({"error": "A unit event object is required."}), 400
+	event_id = str(body.get("event_id") or "").strip()
+	unit_id = str(body.get("unit_id") or "").strip()
+	order_id = str(body.get("order_id") or "").strip()
+	event_type = str(body.get("event_type") or "").strip().upper()
+	reason = str(body.get("reason") or event_type.replace("_", " ").title()).strip()
+	details = body.get("details", {})
+	allowed = {
+		"UNIT_CREATED", "PRODUCT_RECEIVED", "FULFILLMENT_ROUTED",
+		"RETURN_INITIATED", "CUSTOMER_RETURN_INITIATED", "RETURN_RECEIVED",
+		"RECOVERY_CHARGE_RECEIVED", "AGENT_FAILED", "AGENT_TIMEOUT",
+		"EVIDENCE_REQUESTED", "HUMAN_REVIEW_COMPLETED",
+	}
+	if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", event_id):
+		return jsonify({"error": "event_id is required and must be a stable, retry-safe identifier."}), 400
+	if not unit_id or len(unit_id) > 200 or not order_id or len(order_id) > 200:
+		return jsonify({"error": "unit_id and order_id are required (maximum 200 characters each)."}), 400
+	if event_type not in allowed:
+		return jsonify({"error": "Unsupported unit event_type."}), 400
+	if not isinstance(details, dict) or len(reason) > 500:
+		return jsonify({"error": "details must be an object and reason must be at most 500 characters."}), 400
+	if event_type in {"AGENT_FAILED", "AGENT_TIMEOUT"} and details.get("agent") not in {"receiving", "prep", "pack", "returns", "recovery"}:
+		return jsonify({"error": "Agent failure events require details.agent."}), 400
+	existing = list_unit_events(organization_key, unit_id=unit_id)
+	prior = next((event for event in existing if event["event_id"] == event_id), None)
+	canonical_details = {**details, "unit_id": unit_id, "order_id": order_id}
+	if prior:
+		if prior["event_type"] == event_type and prior["details"] == canonical_details:
+			return jsonify({"event_id": event_id, "status": "duplicate"}), 200
+		return jsonify({"error": "event_id was already used for different event content."}), 409
+	try:
+		save_unit_event(
+			organization_key, unit_id, order_id, event_type, reason,
+			actor_id="agent:event-ingest", details=details, event_id=event_id,
+		)
+	except Exception:
+		app.logger.exception("Could not persist unit event %s", event_id)
+		return jsonify({"error": "Could not persist unit event."}), 500
+	return jsonify({"event_id": event_id, "status": "created"}), 201
 
 
 @app.post("/v1/agent/records/<record_id>/retry")

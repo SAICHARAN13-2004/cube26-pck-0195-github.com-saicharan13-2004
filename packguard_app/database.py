@@ -359,6 +359,25 @@ def list_audit_events(record_id: str, org_id: str) -> list[dict[str, Any]]:
 	return events
 
 
+def list_unit_events(org_id: str, *, unit_id: str | None = None, order_id: str | None = None) -> list[dict[str, Any]]:
+	"""Read the tenant-scoped business-event stream stored under unit:<unit_id>."""
+	with connect(org_id) as connection:
+		rows = connection.execute(
+			"SELECT * FROM audit_events WHERE org_id = ? AND record_id LIKE 'unit:%' ORDER BY created_at DESC",
+			(org_id,),
+		).fetchall()
+	events = []
+	for row in rows:
+		event = dict(row)
+		event["details"] = json.loads(event.pop("details_json"))
+		if unit_id and event["details"].get("unit_id") != unit_id:
+			continue
+		if order_id and event["details"].get("order_id") != order_id:
+			continue
+		events.append(event)
+	return events
+
+
 def save_support_request(ticket: dict[str, Any]) -> None:
 	with connect(ticket["org_id"]) as connection:
 		connection.execute(

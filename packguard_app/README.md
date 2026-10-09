@@ -67,6 +67,10 @@ Start Ollama before starting PackGuard. `OLLAMA_MODEL` selects the chat assistan
 
 ### CUBE Evidence Contract 1.1
 
+### Unit passport and event-driven routing
+
+Signed-in operators can open **Unit passport** from the main navigation or visit `/unit-passport`. Enter an order ID and select FBA, MFN, or 3PL; when the order has multiple units, supply the unit ID. The page and `GET /api/unit-passport?order_id=...&channel=...&unit_id=...` expose a per-unit stage summary and a deterministic next-action recommendation. Routing treats FBA as Prep then skips Pack, and MFN/3PL as Pack then skips Prep. Return work waits for `RETURN_RECEIVED`, while recovery waits for `RECOVERY_CHARGE_RECEIVED` and carries upstream evidence references. The router only recommends actions; it does not invoke disconnected managers. `POST /v1/agent/events` accepts retry-safe unit events with `Authorization: Bearer <PACKGUARD_UNIT_EVENT_TOKEN>`. Configure a unique token of at least 32 characters and `PACKGUARD_AGENT_API_ORG_ID`; event rows are stored in the tenant-scoped audit log. This adds the shared event feed, but Receiving/Returns manager connections and event-driven manager invocation remain unimplemented.
+
 The **CUBE contract capture** page and `/v1` API implement the fixed 1.1 record shape for this Pack Manager pod. The operator capture API writes `agent=pack` records; the machine integration accepts `agent=prep` records and exposes the resulting `agent=pack` records to downstream agents. The Pack check keys are published here and must remain stable:
 
 | `check_key` | Meaning |

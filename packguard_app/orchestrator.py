@@ -19,6 +19,100 @@ FAILED_VISION_STATUSES = {
     "MULTIPLE_CANDIDATES_UNSUPPORTED",
 }
 
+RETURN_START_EVENTS = {"RETURN_INITIATED", "CUSTOMER_RETURN_INITIATED"}
+AGENT_FAILURE_EVENTS = {"AGENT_FAILED", "AGENT_TIMEOUT"}
+
+
+def decide_unit_next_action(
+    stages: list[dict[str, Any]], events: list[dict[str, Any]],
+    route: dict[str, str], evidence_refs: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Recommend a safe next step from recorded unit events and evidence.
+
+    This router never invokes a manager or mutates evidence records.
+    """
+    by_agent = {str(stage.get("agent")): stage for stage in stages}
+    event_types = {str(event.get("event_type", "")).upper() for event in events}
+    evidence = evidence_refs or []
+
+    def review(agent: str, reason: str) -> dict[str, Any]:
+        return {"kind": "human_review", "agent": agent, "reason": reason}
+
+    def manager_action(agent: str, reason: str) -> dict[str, Any]:
+        if not by_agent.get(agent, {}).get("connected"):
+            return {"kind": "handoff_required", "agent": agent,
+                    "reason": f"{reason} The {agent.title()} manager is not connected; no manager was invoked."}
+        return {"kind": "operator_action", "agent": agent,
+                "reason": f"{reason} Open the {agent.title()} manager to continue."}
+
+    def recent_failure(agent: str) -> dict[str, Any] | None:
+        captured_at = str(by_agent.get(agent, {}).get("captured_at") or "")
+        failures = [event for event in events
+                    if str(event.get("event_type", "")).upper() in AGENT_FAILURE_EVENTS
+                    and str((event.get("details") or {}).get("agent", "")).lower() == agent
+                    and str(event.get("created_at", "")) >= captured_at]
+        if not failures:
+            return None
+        failure = max(failures, key=lambda item: str(item.get("created_at", "")))
+        details = failure.get("details") or {}
+        attempt = details.get("attempt_number", 1)
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+            attempt = 1
+        if attempt < 2:
+            return {"kind": "retry_required", "agent": agent, "attempt_number": attempt + 1,
+                    "reason": f"{agent.title()} reported {failure['event_type']}; request one retry and retain the failure event."}
+        return review(agent, f"{agent.title()} failed after a retry. Keep the unit in review.")
+
+    if "PRODUCT_RECEIVED" not in event_types:
+        return {"kind": "wait_for_event", "event": "PRODUCT_RECEIVED", "reason": "The unit has not been marked received."}
+    receiving = by_agent.get("receiving", {"state": "awaiting", "connected": False})
+    failure = recent_failure("receiving")
+    if failure:
+        return failure
+    if receiving.get("state") in {"attention", "pending"}:
+        return review("receiving", "Receiving evidence is incomplete, failed, or needs review.")
+    if receiving.get("state") != "done":
+        return manager_action("receiving", "The receipt event is recorded; Receiving is next.")
+
+    forward_agent = route.get("next_agent")
+    if forward_agent not in {"prep", "pack"}:
+        return review("orchestrator", "No valid Prep or Pack route is available for this fulfillment channel.")
+    stage = by_agent.get(forward_agent, {"state": "awaiting", "connected": False})
+    failure = recent_failure(forward_agent)
+    if failure:
+        return failure
+    if stage.get("state") in {"attention", "pending", "blocked"}:
+        return review(forward_agent, f"{forward_agent.title()} evidence needs attention before the unit can continue.")
+    if stage.get("state") != "done":
+        return manager_action(forward_agent, f"The route selects {forward_agent.title()} and skips {route.get('skipped_agent', 'the other manager')}.")
+
+    if not event_types.intersection(RETURN_START_EVENTS):
+        return {"kind": "wait_for_event", "event": "RETURN_INITIATED", "reason": "Forward fulfillment is complete; wait until a customer return is initiated."}
+    if "RETURN_RECEIVED" not in event_types:
+        return {"kind": "wait_for_event", "event": "RETURN_RECEIVED", "reason": "The return is in transit; inspect it after physical arrival."}
+    returns = by_agent.get("returns", {"state": "awaiting", "connected": False})
+    failure = recent_failure("returns")
+    if failure:
+        return failure
+    if returns.get("state") in {"attention", "pending", "blocked"}:
+        return review("returns", "Return evidence is incomplete or needs human review.")
+    if returns.get("state") != "done":
+        return manager_action("returns", "The physical return arrived; inspect identity, completeness, and condition.")
+
+    if "RECOVERY_CHARGE_RECEIVED" not in event_types:
+        return {"kind": "wait_for_event", "event": "RECOVERY_CHARGE_RECEIVED", "reason": "Returns is complete; Recovery runs only when a charge event arrives."}
+    recovery = by_agent.get("recovery", {"state": "ready", "connected": False})
+    failure = recent_failure("recovery")
+    if failure:
+        return failure
+    if recovery.get("state") in {"attention", "pending", "blocked"} or not evidence:
+        return review("recovery", "A charge arrived, but usable upstream evidence is missing or needs review.")
+    if recovery.get("state") != "done":
+        action = manager_action("recovery", "A charge arrived; evaluate it against available unit evidence.")
+        action["evidence_refs"] = evidence
+        return action
+    return {"kind": "journey_complete", "reason": "All applicable stages have a recorded outcome."}
+
 
 def _vision_observation(vision_result: dict[str, Any]) -> str:
     suggested = str(vision_result.get("suggested_observed_contents") or "").strip()
